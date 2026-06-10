@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use pythonize::{depythonize, pythonize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -1165,7 +1165,7 @@ impl KvRouter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (token_ids, router_config_override=None, request_id=None, update_indexer=false, block_mm_infos=None, lora_name=None, routing_constraints=None))]
+    #[pyo3(signature = (token_ids, router_config_override=None, request_id=None, update_indexer=false, block_mm_infos=None, lora_name=None, routing_constraints=None, allowed_worker_ids=None))]
     fn best_worker<'p>(
         &self,
         py: Python<'p>,
@@ -1176,6 +1176,7 @@ impl KvRouter {
         block_mm_infos: Option<PyObject>,
         lora_name: Option<String>,
         routing_constraints: Option<RoutingConstraints>,
+        allowed_worker_ids: Option<Vec<WorkerId>>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let router_config_override = if let Some(obj) = router_config_override {
             let override_config: RouterConfigOverride =
@@ -1191,6 +1192,8 @@ impl KvRouter {
 
         let chooser = self.inner.chooser.clone();
         let update_states = request_id.is_some();
+        let allowed_worker_ids: Option<HashSet<WorkerId>> =
+            allowed_worker_ids.map(|ids| ids.into_iter().collect());
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let outcome = chooser
@@ -1205,7 +1208,7 @@ impl KvRouter {
                     0.0,
                     None,
                     None,
-                    None, // allowed_worker_ids: pass via RoutingHints in PreprocessedRequest path
+                    allowed_worker_ids,
                     routing_constraints.map(Into::into).unwrap_or_default(),
                 )
                 .await
