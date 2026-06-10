@@ -412,6 +412,7 @@ def compute_block_hash_for_seq(
     block_mm_infos: Optional[List[Optional[Dict[str, Any]]]] = None,
     lora_name: Optional[str] = None,
     is_eagle: Optional[bool] = None,
+    token_id_hash_fn: Optional[Callable[[int], int]] = None,
 ) -> List[int]:
     """
     Compute block hashes for a sequence of tokens, optionally including multimodal metadata.
@@ -435,6 +436,8 @@ def compute_block_hash_for_seq(
         lora_name: Optional LoRA adapter name for adapter-aware block hashing.
         is_eagle: Optional Eagle mode flag. When true, hashes use overlapping
                   `kv_block_size + 1` token windows with `kv_block_size` stride.
+        token_id_hash_fn: Optional callable applied to each token ID before block hashing.
+                          It must return an int in the u32 range.
 
     Returns:
         List of block hashes (one per block)
@@ -2541,6 +2544,7 @@ class KvRouter:
         block_size: int,
         kv_router_config: KvRouterConfig,
         aic_perf_config: Optional[AicPerfConfig] = None,
+        token_id_hash_fn: Optional[Callable[[int], int]] = None,
     ) -> None:
         """
         Create a new KvRouter instance.
@@ -2550,6 +2554,8 @@ class KvRouter:
             block_size: The KV cache block size
             kv_router_config: Configuration for the KV router
             aic_perf_config: Optional AIC perf-model config for effective prefill load tracking
+            token_id_hash_fn: Optional callable applied to routing token IDs before KV overlap hashing;
+                              backend token_ids are unchanged. It must return an int in the u32 range.
         """
         ...
 

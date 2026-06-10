@@ -214,6 +214,23 @@ def test_radix_tree_clear_all_blocks():
 # =============================================================================
 
 
+def test_compute_block_hash_for_seq_token_id_hash_fn():
+    """Test custom token ID hashing matches explicitly remapped token IDs."""
+    tokens = [1, 2, 3, 4] * 8
+    remapped = [token + 1000 for token in tokens]
+
+    hashes_with_fn = compute_block_hash_for_seq(
+        tokens,
+        DEFAULT_BLOCK_SIZE,
+        token_id_hash_fn=lambda token: token + 1000,
+    )
+    hashes_remapped = compute_block_hash_for_seq(remapped, DEFAULT_BLOCK_SIZE)
+    hashes_default = compute_block_hash_for_seq(tokens, DEFAULT_BLOCK_SIZE)
+
+    assert hashes_with_fn == hashes_remapped
+    assert hashes_with_fn != hashes_default
+
+
 # @pytest.mark.timeout(5)
 def test_mm_block_hash_computation_basic():
     """Test that same tokens with different MM content produce different hashes."""

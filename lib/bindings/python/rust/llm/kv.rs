@@ -27,6 +27,7 @@ use tracing;
 
 use llm_rs::kv_router::KvPushRouter as RsKvPushRouter;
 use llm_rs::kv_router::publisher::{KvEventSourceConfig, create_stored_blocks};
+use llm_rs::protocols::common::preprocessor::{MmRoutingInfo, PreprocessedRequest};
 use llm_rs::protocols::common::timing::RequestTracker;
 use llm_rs::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
 
@@ -35,6 +36,41 @@ use super::entrypoint::AicPerfConfig;
 
 fn depythonize_block_mm_infos(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Option<BlockExtraInfo>>> {
     depythonize(obj).map_err(to_pyerr)
+}
+
+fn validate_token_id_hash_fn(
+    py: Python<'_>,
+    token_id_hash_fn: Option<&PyObject>,
+) -> PyResult<()> {
+    if let Some(hash_fn) = token_id_hash_fn {
+        if !hash_fn.bind(py).is_callable() {
+            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "token_id_hash_fn must be callable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hash_token_ids(
+    py: Python<'_>,
+    token_ids: &[u32],
+    token_id_hash_fn: Option<&PyObject>,
+) -> PyResult<Option<Vec<u32>>> {
+    let Some(hash_fn) = token_id_hash_fn else {
+        return Ok(None);
+    };
+    let hash_fn = hash_fn.bind(py);
+    let mut hashed = Vec::with_capacity(token_ids.len());
+    for &token_id in token_ids {
+        let value = hash_fn.call1((token_id,))?;
+        hashed.push(value.extract::<u32>().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "token_id_hash_fn must return an int in the u32 range",
+            )
+        })?);
+    }
+    Ok(Some(hashed))
 }
 
 #[cfg(feature = "kv-indexer")]
@@ -175,25 +211,29 @@ fn init_standalone_logging() {
 }
 
 #[pyfunction]
-#[pyo3(name = "compute_block_hash_for_seq", signature = (tokens, kv_block_size, block_mm_infos=None, lora_name=None, is_eagle=None))]
+#[pyo3(name = "compute_block_hash_for_seq", signature = (tokens, kv_block_size, block_mm_infos=None, lora_name=None, is_eagle=None, token_id_hash_fn=None))]
 pub fn compute_block_hash_for_seq_py(
-    _py: Python,
+    py: Python,
     tokens: Vec<u32>,
     kv_block_size: usize,
     block_mm_infos: Option<Bound<PyAny>>,
     lora_name: Option<String>,
     is_eagle: Option<bool>,
+    token_id_hash_fn: Option<PyObject>,
 ) -> PyResult<Vec<u64>> {
     if kv_block_size == 0 {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
             "kv_block_size cannot be 0",
         ));
     }
+    validate_token_id_hash_fn(py, token_id_hash_fn.as_ref())?;
 
     let mm_infos = block_mm_infos
         .as_ref()
         .map(depythonize_block_mm_infos)
         .transpose()?;
+    let hashed_tokens = hash_token_ids(py, &tokens, token_id_hash_fn.as_ref())?;
+    let tokens = hashed_tokens.unwrap_or(tokens);
 
     let hashes = compute_block_hash_for_seq(
         &tokens,
@@ -852,6 +892,7 @@ async fn create_kv_router_from_endpoint(
 #[pyclass]
 pub(crate) struct KvRouter {
     inner: Arc<RsKvPushRouter>,
+    token_id_hash_fn: Option<PyObject>,
 }
 
 /// Attach worker_id info from the tracker to `routing_data` so it survives the
@@ -882,6 +923,39 @@ fn inject_timing_from_tracker(
 
 // TODO: can this reuse the stream conversion method in Client bindings?
 impl KvRouter {
+    fn routing_token_ids(&self, py: Python<'_>, token_ids: &[u32]) -> PyResult<Vec<u32>> {
+        Ok(
+            hash_token_ids(py, token_ids, self.token_id_hash_fn.as_ref())?
+                .unwrap_or_else(|| token_ids.to_vec()),
+        )
+    }
+
+    fn apply_token_id_hash_fn_to_request(
+        &self,
+        py: Python<'_>,
+        request: &mut PreprocessedRequest,
+    ) -> PyResult<()> {
+        if self.token_id_hash_fn.is_none() {
+            return Ok(());
+        }
+
+        if let Some(mm_routing_info) = request.mm_routing_info.as_mut() {
+            let source_tokens = if mm_routing_info.routing_token_ids.is_empty() {
+                request.token_ids.clone()
+            } else {
+                mm_routing_info.routing_token_ids.clone()
+            };
+            mm_routing_info.routing_token_ids = self.routing_token_ids(py, &source_tokens)?;
+        } else {
+            request.mm_routing_info = Some(MmRoutingInfo {
+                routing_token_ids: self.routing_token_ids(py, &request.token_ids)?,
+                block_mm_infos: Vec::new(),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Helper method to process a request and create a Python async generator
     fn process_request_to_stream<'p>(
         py: Python<'p>,
@@ -970,13 +1044,16 @@ impl KvRouter {
     /// Note: Worker type for Prometheus metrics is inferred from the endpoint name/component
     /// (contains "prefill") or by `router_track_active_blocks` being disabled.
     #[new]
-    #[pyo3(signature = (endpoint, block_size, kv_router_config, aic_perf_config=None))]
+    #[pyo3(signature = (endpoint, block_size, kv_router_config, aic_perf_config=None, token_id_hash_fn=None))]
     fn new(
+        py: Python,
         endpoint: &Endpoint,
         block_size: usize,
         kv_router_config: &super::entrypoint::KvRouterConfig,
         aic_perf_config: Option<&AicPerfConfig>,
+        token_id_hash_fn: Option<PyObject>,
     ) -> PyResult<Self> {
+        validate_token_id_hash_fn(py, token_id_hash_fn.as_ref())?;
         let prefill_load_estimator = aic_perf_config
             .map(|config| {
                 Python::with_gil(|py| {
@@ -999,7 +1076,7 @@ impl KvRouter {
             .map_err(to_pyerr)?;
 
         let runtime = pyo3_async_runtimes::tokio::get_runtime();
-        runtime.block_on(async move {
+        let inner = runtime.block_on(async move {
             let client = endpoint.inner.client().await.map_err(to_pyerr)?;
 
             // Create PushRouter with KV router mode
@@ -1026,9 +1103,12 @@ impl KvRouter {
 
             let kv_push_router = RsKvPushRouter::new(push_router, kv_router);
 
-            Ok(Self {
-                inner: Arc::new(kv_push_router),
-            })
+            Ok(Arc::new(kv_push_router))
+        })?;
+
+        Ok(Self {
+            inner,
+            token_id_hash_fn,
         })
     }
 
@@ -1135,7 +1215,8 @@ impl KvRouter {
             request_builder.routing(Some(routing));
         }
 
-        let request = request_builder.build().map_err(to_pyerr)?;
+        let mut request = request_builder.build().map_err(to_pyerr)?;
+        self.apply_token_id_hash_fn_to_request(py, &mut request)?;
 
         // Use the helper method to process the request
         Self::process_request_to_stream(py, self.inner.clone(), request, Some(tracker))
@@ -1159,6 +1240,8 @@ impl KvRouter {
                 t
             }
         };
+
+        self.apply_token_id_hash_fn_to_request(py, &mut request)?;
 
         // Use the helper method to process the request
         Self::process_request_to_stream(py, self.inner.clone(), request, Some(tracker))
@@ -1189,6 +1272,7 @@ impl KvRouter {
         let block_mm_infos = block_mm_infos
             .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
             .transpose()?;
+        let token_ids = self.routing_token_ids(py, &token_ids)?;
 
         let chooser = self.inner.chooser.clone();
         let update_states = request_id.is_some();
@@ -1307,6 +1391,7 @@ impl KvRouter {
         let block_mm_infos = block_mm_infos
             .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
             .transpose()?;
+        let token_ids = self.routing_token_ids(py, &token_ids)?;
         let chooser = self.inner.chooser.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1350,6 +1435,7 @@ impl KvRouter {
         let block_mm_infos = block_mm_infos
             .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
             .transpose()?;
+        let token_ids = self.routing_token_ids(py, &token_ids)?;
         let chooser = self.inner.chooser.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
