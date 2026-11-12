@@ -1428,10 +1428,12 @@ fn glm_unfinished_call_with_prefill(
                 .is_some() =>
         {
             let pending = parser.reset();
-            let prefix = input
+            let seed = prefill.prefix.as_deref().unwrap_or_default();
+            let source = format!("{seed}{input}");
+            let prefix = source
                 .strip_suffix(&pending)
                 .ok_or_else(|| anyhow::anyhow!("GLM pending input is not a source suffix"))?;
-            Ok(Some(prefix.len()))
+            Ok(Some(prefix.len().saturating_sub(seed.len())))
         }
         Err(error) => Err(error),
     }
