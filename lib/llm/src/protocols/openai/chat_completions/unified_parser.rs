@@ -40,10 +40,10 @@ use std::sync::LazyLock;
 use async_stream::stream;
 use dynamo_parsers::tool_calling::ToolDefinition;
 use dynamo_parsers_v2::{
-    ArgumentFraming, InvalidGuidedPayloadPolicy, MalformedToolCallPolicy, Tool, ToolCallPolicy,
-    UnifiedEvent, UnifiedParser, UnifiedParserContinuation, UnifiedParserEvent, UnifiedParserInit,
-    UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
-    create_unified_parser_for_family,
+    ArgumentFraming, InvalidGuidedPayloadPolicy, MalformedToolCallPolicy, ReasoningCloserPolicy,
+    Tool, ToolCallPolicy, UnifiedEvent, UnifiedParser, UnifiedParserContinuation,
+    UnifiedParserEvent, UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState,
+    UnifiedToolOutputMode, create_unified_parser_for_family,
 };
 use dynamo_protocols::types::{
     ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
@@ -78,6 +78,14 @@ pub(crate) const GEMMA4_UNIFIED_FAMILY: &str = "gemma4";
 /// The empty thought channel Gemma 4 opens with thinking off.
 pub(crate) const GEMMA4_EMPTY_THOUGHT_CHANNEL: &str = "<|channel>thought\n<channel|>";
 pub(crate) const GLM47_UNIFIED_FAMILY: &str = "glm47";
+fn reasoning_closer_policy(family: &str, mode: &UnifiedToolOutputMode) -> ReasoningCloserPolicy {
+    if family == GLM47_UNIFIED_FAMILY && matches!(mode, UnifiedToolOutputMode::Native) {
+        ReasoningCloserPolicy::Structural
+    } else {
+        ReasoningCloserPolicy::QuoteAware
+    }
+}
+
 pub(crate) fn incomplete_tool_call_error() -> DynamoError {
     DynamoError::builder()
         .class(ErrorClass::BackendProtocol)
@@ -924,7 +932,7 @@ fn detect_prefill(family: &str, content: &str) -> anyhow::Result<UnifiedParserSt
             // that case as `None` instead of `Reasoning`.
             let opener = first_unquoted_marker_position(content, opener_marker);
             let closer = first_unquoted_marker_position(content, closer_marker);
-            if family == "minimax_m3"
+            if matches!(family, "minimax_m3" | GLM47_UNIFIED_FAMILY)
                 && first_unquoted_native_tool_call_marker(content, family).is_some_and(|tool_at| {
                     opener
                         .into_iter()
@@ -932,7 +940,7 @@ fn detect_prefill(family: &str, content: &str) -> anyhow::Result<UnifiedParserSt
                         .all(|marker_at| tool_at < marker_at)
                 })
             {
-                // M3 parameters contain literal, unquoted text. A reasoning
+                // Native parameters contain literal, unquoted text. A reasoning
                 // closer inside an argument cannot imply a prompt-opened thought.
                 // Let the parser own any channels after this first native call.
                 return Ok(UnifiedParserStartingState::None);
@@ -1374,34 +1382,59 @@ fn batch_tool_output_mode(
 /// Ask the grammar owner which source bytes remain uncommitted. A literal tool
 /// closer inside an argument must not hide an unfinished sibling from recovery.
 pub(crate) fn glm_unfinished_call(input: &str) -> anyhow::Result<Option<usize>> {
+    glm_unfinished_call_with_prefill(
+        input,
+        &StreamPrefill {
+            starting_state: detect_prefill(GLM47_UNIFIED_FAMILY, input)?,
+            prefix: None,
+        },
+    )
+}
+
+fn glm_unfinished_call_with_prefill(
+    input: &str,
+    prefill: &StreamPrefill,
+) -> anyhow::Result<Option<usize>> {
     let mut parser = create_unified_parser_for_family(GLM47_UNIFIED_FAMILY, &[])?;
+    parser.initialize_request(UnifiedParserInit {
+        starting_state: if prefill.prefix.is_some() {
+            UnifiedParserStartingState::None
+        } else {
+            prefill.starting_state
+        },
+        reasoning_closer_policy: ReasoningCloserPolicy::Structural,
+        ..Default::default()
+    })?;
+    parser.set_tool_call_policy(ToolCallPolicy {
+        malformed: MalformedToolCallPolicy::Reject,
+        ..Default::default()
+    })?;
     let mut output = UnifiedParserOutput::default();
-    parser.parse_into(input, &mut output)?;
-    let pending = parser.reset();
-    let prefix = input
-        .strip_suffix(&pending)
-        .ok_or_else(|| anyhow::anyhow!("GLM pending input is not a source suffix"))?;
-    // Only prose after the last completed call can quote a pending marker.
-    // Argument quotes belong to the native grammar and cannot span sibling calls.
-    let mut prose = String::new();
-    for event in output.events {
-        match event {
-            UnifiedParserEvent::ToolCall(call) if call.complete => prose.clear(),
-            UnifiedParserEvent::Text(text) | UnifiedParserEvent::Reasoning(text) => {
-                prose.push_str(&text)
-            }
-            _ => {}
-        }
+    if let Some(prefix) = &prefill.prefix {
+        parser.parse_into(prefix, &mut output)?;
+        anyhow::ensure!(
+            output.events.is_empty(),
+            "prompt prefix emitted visible output"
+        );
     }
-    let pending_offset = prose.len();
-    prose.push_str(&pending);
-    let markers = native_tool_call_start_tokens(GLM47_UNIFIED_FAMILY)
-        .expect("registered GLM native grammar has start tokens");
-    Ok(markers
-        .iter()
-        .filter_map(|marker| first_unquoted_marker_position_after(&prose, marker, pending_offset))
-        .min()
-        .map(|start| prefix.len() + start - pending_offset))
+    parser.parse_into(input, &mut output)?;
+    // Let the native grammar resolve pending prose quotation at EOF, then reject
+    // actual incomplete calls. Rebuilding prose would erase channel boundaries.
+    match parser.finish() {
+        Ok(_) => Ok(None),
+        Err(error)
+            if error
+                .downcast_ref::<dynamo_parsers_v2::MalformedToolCall>()
+                .is_some() =>
+        {
+            let pending = parser.reset();
+            let prefix = input
+                .strip_suffix(&pending)
+                .ok_or_else(|| anyhow::anyhow!("GLM pending input is not a source suffix"))?;
+            Ok(Some(prefix.len()))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Merge adjacent same-kind text/reasoning deltas so one `push` does not become three
@@ -1568,6 +1601,7 @@ struct QwenXmlStreamState {
 #[derive(Default)]
 struct GlmNativeStreamState {
     input_for_truncation_check: String,
+    prefill: Option<StreamPrefill>,
 }
 
 /// Per-choice streaming state: one parser instance plus the bookkeeping the OpenAI
@@ -1975,6 +2009,9 @@ impl ChoiceState {
         // tokens afterward so the open call and later calls share that counter.
         // Guided JSON inherits only the resolved channel, since its request constraint
         // owns the tool envelope. Vendor overrides retain their initialization contract.
+        let glm_prefill = (family == GLM47_UNIFIED_FAMILY
+            && matches!(&tool_output_mode, UnifiedToolOutputMode::Native))
+        .then(|| prefill.clone());
         let harmony = family == "gpt_oss";
         let native_harmony = harmony && matches!(&tool_output_mode, UnifiedToolOutputMode::Native);
         let vendor_harmony = harmony
@@ -2044,6 +2081,7 @@ impl ChoiceState {
                 },
                 tool_output_mode: tool_output_mode.clone(),
                 invalid_guided_payload: invalid_guided_payload_policy(guided_streaming),
+                reasoning_closer_policy: reasoning_closer_policy(family, &tool_output_mode),
             })?;
             apply_argument_framing(family, parser.as_mut(), argument_framing)?;
             if let Some(tokens) = harmony_prefix_tokens {
@@ -2081,7 +2119,10 @@ impl ChoiceState {
                 if uses_qwen_xml_grammar(family) {
                     NativeGrammarState::QwenXml(QwenXmlStreamState::default())
                 } else if family == GLM47_UNIFIED_FAMILY {
-                    NativeGrammarState::Glm(GlmNativeStreamState::default())
+                    NativeGrammarState::Glm(GlmNativeStreamState {
+                        prefill: glm_prefill,
+                        ..Default::default()
+                    })
                 } else {
                     NativeGrammarState::None
                 }
@@ -2326,7 +2367,11 @@ impl ChoiceState {
         }
         if let NativeGrammarState::Glm(glm) = &self.native_grammar_state {
             let input = &glm.input_for_truncation_check;
-            match glm_unfinished_call(input) {
+            let incomplete = match &glm.prefill {
+                Some(prefill) => glm_unfinished_call_with_prefill(input, prefill),
+                None => glm_unfinished_call(input),
+            };
+            match incomplete {
                 Ok(Some(start)) => {
                     self.incomplete_native_call = true;
                     tracing::warn!(
@@ -2340,7 +2385,10 @@ impl ChoiceState {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(%error, why = "glm_pending_input_failed", "using parser finish recovery")
+                    self.failed = true;
+                    self.parse_error = Some(error);
+                    self.parser.reset();
+                    return Vec::new();
                 }
             }
         }
@@ -2943,9 +2991,18 @@ fn parse_complete_in_mode(
         }
         _ => None,
     };
+    let starting_state = policy.batch_starting_state(family, content)?;
     let incomplete_start = (family == GLM47_UNIFIED_FAMILY
         && matches!(&effective_mode, UnifiedToolOutputMode::Native))
-    .then(|| glm_unfinished_call(content))
+    .then(|| {
+        glm_unfinished_call_with_prefill(
+            content,
+            &StreamPrefill {
+                starting_state,
+                prefix: None,
+            },
+        )
+    })
     .transpose()?
     .flatten();
     let content = &content[..incomplete_start.unwrap_or(content.len())];
@@ -2958,7 +3015,8 @@ fn parse_complete_in_mode(
         } else {
             Vec::new()
         },
-        starting_state: policy.batch_starting_state(family, content)?,
+        starting_state,
+        reasoning_closer_policy: reasoning_closer_policy(family, &effective_mode),
         tool_output_mode: effective_mode,
         ..UnifiedParserInit::default()
     })?;
@@ -4425,6 +4483,102 @@ pub(crate) mod tests {
             model_eos: Vec::new(),
         };
         Annotated::from_data(response)
+    }
+
+    #[tokio::test]
+    async fn glm_cross_channel_quote_preserves_native_tool_call() {
+        let raw = "检查 \"unclosed quote and <tool_call> example</think>Answer closes it\". ";
+        let chunks: Vec<String> = raw.chars().map(|ch| ch.to_string()).collect();
+        let native =
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>";
+        let mut input: Vec<_> = chunks.iter().map(|s| chunk(s, false)).collect();
+        input.push(chunk(native, true));
+        let output = apply_stream(
+            stream::iter(input),
+            Some(weather_tools()),
+            None,
+            false,
+            UnifiedParserStartingState::Reasoning,
+            GLM47_UNIFIED_FAMILY,
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let choices = collect_choices(&output);
+        let reasoning: String = choices
+            .iter()
+            .filter_map(|c| c.delta.reasoning_content.as_deref())
+            .collect();
+        let content: String = choices
+            .iter()
+            .filter_map(|c| match c.delta.content.as_ref() {
+                Some(ChatCompletionMessageContent::Text(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let calls: Vec<_> = choices
+            .iter()
+            .flat_map(|c| c.delta.tool_calls.as_ref().into_iter().flatten())
+            .collect();
+        eprintln!(
+            "observed chars={} reasoning={} content={} calls={} errors={}",
+            chunks.iter().map(|s| s.chars().count()).sum::<usize>(),
+            reasoning.chars().count(),
+            content.chars().count(),
+            calls.len(),
+            output.iter().filter(|a| a.is_error()).count()
+        );
+        assert_eq!(reasoning, "检查 \"unclosed quote and <tool_call> example");
+        assert_eq!(content, "Answer closes it\". ");
+        assert!(!calls.is_empty());
+        assert!(!output.iter().any(|a| a.is_error()));
+    }
+
+    #[test]
+    fn glm_incomplete_call_started_in_prompt_maps_to_generated_offset_zero() {
+        let prefill = StreamPrefill {
+            starting_state: UnifiedParserStartingState::None,
+            prefix: Some(std::sync::Arc::from(
+                "<tool_call>get_weather<arg_key>city</arg_key><arg_value>",
+            )),
+        };
+        assert_eq!(
+            glm_unfinished_call_with_prefill("Paris", &prefill).unwrap(),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn glm_cross_channel_quote_cannot_hide_an_incomplete_call() {
+        for gap in ["", "answer "] {
+            let raw = format!(
+                "\"</think>{gap}<tool_call>get_weather<arg_key>city</arg_key><arg_value>\"Paris"
+            );
+            let prefill = StreamPrefill {
+                starting_state: UnifiedParserStartingState::Reasoning,
+                prefix: None,
+            };
+            assert!(
+                glm_unfinished_call_with_prefill(&raw, &prefill)
+                    .unwrap()
+                    .is_some()
+            );
+            let output = apply_stream(
+                stream::iter(vec![chunk(&raw, true)]),
+                Some(weather_tools()),
+                None,
+                false,
+                UnifiedParserStartingState::Reasoning,
+                GLM47_UNIFIED_FAMILY,
+            )
+            .collect::<Vec<_>>()
+            .await;
+            assert_eq!(output.iter().filter(|a| a.is_error()).count(), 1, "{raw:?}");
+            assert!(
+                !collect_choices(&output)
+                    .iter()
+                    .any(|c| c.finish_reason.is_some())
+            );
+        }
     }
 
     fn weather_tools() -> Vec<ToolDefinition> {
@@ -12334,6 +12488,7 @@ pub(crate) mod tests {
                             starting_state: UnifiedParserStartingState::None,
                             tool_output_mode: mode.clone(),
                             invalid_guided_payload: invalid_guided_payload_policy(true),
+                            reasoning_closer_policy: ReasoningCloserPolicy::default(),
                         })
                         .unwrap();
                     let mut adapter = ChoiceState::new(
@@ -12571,6 +12726,7 @@ pub(crate) mod tests {
                         starting_state: UnifiedParserStartingState::None,
                         tool_output_mode: UnifiedToolOutputMode::Native,
                         invalid_guided_payload: invalid_guided_payload_policy(true),
+                        reasoning_closer_policy: ReasoningCloserPolicy::default(),
                     })
                     .unwrap();
                 let mut output = UnifiedParserOutput::default();

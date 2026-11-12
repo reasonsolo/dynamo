@@ -1130,3 +1130,83 @@ async fn explicit_thinking_controls_reach_the_chat_engine() {
     })
     .await;
 }
+
+/// Feed raw native bytes through OpenAIPreprocessor before the HTTP compatibility
+/// adapter. Raw ScriptedChatEngine fixtures alone would bypass the parser.
+#[tokio::test]
+#[serial]
+async fn glm_cross_channel_quote_has_successful_tool_terminal_streaming_and_unary() {
+    temp_env::async_with_vars([
+        (DYN_ENABLE_ANTHROPIC_API, Some("1")),
+        (DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("0")),
+        ("DYN_PARSER_VERSION", Some("2")),
+    ], async {
+        for (streaming, incomplete) in [(true, false), (false, false), (true, true), (false, true)] {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/sample-models/mock-llama-3.1-8b-instruct");
+            let mut card = dynamo_llm::model_card::ModelDeploymentCard::load_from_disk(path, None).unwrap();
+            card.runtime_config.reasoning_parser = Some("glm47".into());
+            card.runtime_config.tool_call_parser = Some("glm47".into());
+            let parser = dynamo_llm::preprocessor::OpenAIPreprocessor::new(card.clone()).unwrap();
+            let raw = if incomplete {
+                "\"</think><tool_call>read_file<arg_key>path</arg_key><arg_value>\"Paris"
+            } else {
+                "检查 \"open quote and <tool_call> example</think>Answer\". <tool_call>read_file<arg_key>path</arg_key><arg_value>/tmp/example</arg_value></tool_call>"
+            };
+            let mut script: Script = raw.chars().map(|ch| {
+                dynamo_llm::protocols::Annotated::from_data(serde_json::from_value(json!({
+                    "id":"glm", "object":"chat.completion.chunk", "created":0, "model":MODEL,
+                    "choices":[{"index":0,"delta":{"content":ch.to_string()},"finish_reason":null}]
+                })).unwrap())
+            }).collect();
+            script.push(dynamo_llm::protocols::Annotated::from_data(serde_json::from_value(json!({
+                "id":"glm", "object":"chat.completion.chunk", "created":0, "model":MODEL,
+                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]
+            })).unwrap()));
+            let engine = Arc::new(ScriptedChatEngine::new([Ok(script)]).with_parser(parser));
+            let svc = HarnessService::start_with_engine_and_card(engine, card).await;
+            let response = post_messages(&svc, &json!({
+                "model":MODEL,"max_tokens":32000,"stream":streaming,
+                "thinking":{"type":"adaptive"},"tools":[tool("read_file")],
+                "messages":[{"role":"user","content":"read example"}]
+            })).await;
+            if incomplete {
+                if streaming {
+                    assert_eq!(response.status(), reqwest::StatusCode::OK);
+                    let events = parse_anthropic_sse(&response.text().await.unwrap()).await.unwrap();
+                    assert_eq!(events.last().unwrap().event, "error");
+                    assert!(!events.iter().any(|e| e.event == "message_stop" || e.event == "message_delta"));
+                } else {
+                    assert!(response.status().is_server_error());
+                    let body: Value = response.json().await.unwrap();
+                    assert_eq!(body["type"], "error");
+                    assert_eq!(body["error"]["type"], "api_error");
+                }
+                svc.shutdown().await;
+                continue;
+            }
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            if streaming {
+                let events = parse_anthropic_sse(&response.text().await.unwrap()).await.unwrap();
+                assert_eq!(events.last().unwrap().event, "message_stop");
+                assert!(!events.iter().any(|e| e.event == "error"));
+                let terminal = events.iter().find(|e| e.event == "message_delta").unwrap();
+                assert_eq!(terminal.data["delta"]["stop_reason"], "tool_use");
+                let thinking: String = events.iter().filter_map(|e| e.data["delta"]["thinking"].as_str()).collect();
+                let text: String = events.iter().filter_map(|e| e.data["delta"]["text"].as_str()).collect();
+                assert_eq!(thinking, "检查 \"open quote and <tool_call> example");
+                assert_eq!(text, "Answer\". ");
+                let arguments: String = events.iter().filter_map(|e| e.data["delta"]["partial_json"].as_str()).collect();
+                assert_eq!(serde_json::from_str::<Value>(&arguments).unwrap(), json!({"path":"/tmp/example"}));
+            } else {
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["stop_reason"], "tool_use");
+                let content = body["content"].as_array().unwrap();
+                assert_eq!(content.iter().find(|b| b["type"] == "thinking").unwrap()["thinking"], "检查 \"open quote and <tool_call> example");
+                assert_eq!(content.iter().find(|b| b["type"] == "text").unwrap()["text"], "Answer\". ");
+                assert_eq!(content.iter().find(|b| b["type"] == "tool_use").unwrap()["input"], json!({"path":"/tmp/example"}));
+            }
+            svc.shutdown().await;
+        }
+    }).await;
+}

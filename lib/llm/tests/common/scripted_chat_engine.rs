@@ -58,12 +58,23 @@ impl ScriptGate {
 
 /// Captures translated chat requests and returns one scripted response per request.
 pub struct ScriptedChatEngine {
+    parser: Option<std::sync::Arc<dynamo_llm::preprocessor::OpenAIPreprocessor>>,
     scripts: Mutex<VecDeque<QueuedScript>>,
     requests: Mutex<Vec<NvCreateChatCompletionRequest>>,
     contexts: Mutex<Vec<std::sync::Arc<dyn AsyncEngineContext>>>,
 }
 
 impl ScriptedChatEngine {
+    /// Route scripted raw model bytes through the production parser before HTTP conversion.
+    #[allow(dead_code)]
+    pub fn with_parser(
+        mut self,
+        parser: std::sync::Arc<dynamo_llm::preprocessor::OpenAIPreprocessor>,
+    ) -> Self {
+        self.parser = Some(parser);
+        self
+    }
+
     #[allow(dead_code)]
     pub fn with_interrupted_tail(chunks: Script, split_at: usize, kill_after_stop: bool) -> Self {
         assert!(split_at < chunks.len());
@@ -75,6 +86,7 @@ impl ScriptedChatEngine {
             }])),
             requests: Mutex::new(Vec::new()),
             contexts: Mutex::new(Vec::new()),
+            parser: None,
         }
     }
 
@@ -91,6 +103,7 @@ impl ScriptedChatEngine {
             ),
             requests: Mutex::new(Vec::new()),
             contexts: Mutex::new(Vec::new()),
+            parser: None,
         }
     }
 
@@ -109,6 +122,7 @@ impl ScriptedChatEngine {
                 }])),
                 requests: Mutex::new(Vec::new()),
                 contexts: Mutex::new(Vec::new()),
+                parser: None,
             },
             ScriptGate { release },
         )
@@ -123,6 +137,7 @@ impl ScriptedChatEngine {
             }])),
             requests: Mutex::new(Vec::new()),
             contexts: Mutex::new(Vec::new()),
+            parser: None,
         }
     }
 
@@ -164,7 +179,7 @@ impl
         let (request, context) = request.transfer(());
         let ctx = context.context();
 
-        self.requests.lock().await.push(request);
+        self.requests.lock().await.push(request.clone());
         self.contexts.lock().await.push(ctx.clone());
         let script = self
             .scripts
@@ -243,6 +258,11 @@ impl
                 }
             }
         };
-        Ok(ResponseStream::new(Box::pin(output), ctx))
+        if let Some(parser) = &self.parser {
+            let parsed = parser.postprocessor_parsing_stream(output, &request, true, false)?;
+            Ok(ResponseStream::new(Box::pin(parsed), ctx))
+        } else {
+            Ok(ResponseStream::new(Box::pin(output), ctx))
+        }
     }
 }
