@@ -13,12 +13,33 @@ use dynamo_protocols::types::{
 
 pub(super) const OMITTED_IMAGE: &str = "[image omitted]";
 
-pub(super) fn should_omit_images(state: &super::service_v2::State, model: &str) -> bool {
+pub(super) type ChatEngineSelection = (
+    crate::types::openai::chat_completions::OpenAIChatCompletionsStreamingEngine,
+    crate::protocols::openai::ParsingOptions,
+    bool,
+);
+
+pub(super) fn select_chat_engine(
+    state: &super::service_v2::State,
+    model: &str,
+) -> Result<ChatEngineSelection, crate::discovery::ModelManagerError> {
     state
         .manager()
-        .get_model(model)
-        .and_then(|model| model.input_modality_support("image"))
-        == Some(false)
+        .get_committed_model(model)
+        .ok_or_else(|| crate::discovery::ModelManagerError::ModelNotFound(model.to_owned()))?
+        .get_chat_engine_with_image_policy()
+}
+
+pub(super) fn select_chat_engine_for_capability(
+    state: &super::service_v2::State,
+    model: &str,
+    capability: &str,
+) -> Result<Option<ChatEngineSelection>, crate::discovery::ModelManagerError> {
+    state
+        .manager()
+        .get_committed_model(model)
+        .ok_or_else(|| crate::discovery::ModelManagerError::ModelNotFound(model.to_owned()))?
+        .get_chat_engine_with_image_policy_for_capability(Some(capability))
 }
 
 pub(super) fn omit_chat_images(messages: &mut [ChatCompletionRequestMessage]) {

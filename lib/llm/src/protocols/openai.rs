@@ -463,6 +463,13 @@ pub struct ParsingOptions {
     #[serde(default)]
     pub reasoning_disabled: bool,
 
+    /// The selected worker's opt-in to strict native GLM tool-call failures.
+    #[serde(default)]
+    pub incomplete_glm_tool_call_errors: bool,
+
+    #[serde(default)]
+    pub responses_context_overflow_events: bool,
+
     /// JSON response formatting is a content contract, separate from guided tool JSON.
     #[serde(default)]
     pub structured_response: bool,
@@ -534,6 +541,8 @@ impl ParsingOptions {
             tool_call_parser,
             reasoning_parser,
             reasoning_disabled: false,
+            incomplete_glm_tool_call_errors: false,
+            responses_context_overflow_events: false,
             structured_response: false,
             default_thinking_mode: None,
             tool_choice: None,
@@ -546,6 +555,11 @@ impl ParsingOptions {
                 crate::local_model::runtime_config::default_exclude_tools_when_tool_choice_none(),
             tools: Vec::new(),
         }
+    }
+
+    pub fn with_incomplete_glm_tool_call_errors(mut self, enabled: bool) -> Self {
+        self.incomplete_glm_tool_call_errors = enabled;
+        self
     }
 
     pub fn with_guided_tool_constraint(mut self, constraint: GuidedToolConstraint) -> Self {

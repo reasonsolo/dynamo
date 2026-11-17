@@ -52,7 +52,6 @@ pub(crate) fn hoist_additional_tools(body: &mut Value) -> Result<(), ResponsesCo
 pub(crate) fn body_affinity(body: &Value) -> Option<&str> {
     [
         body.pointer("/conversation_params/conversation_id"),
-        body.get("prompt_cache_key"),
         body.pointer("/client_metadata/thread_id"),
         body.pointer("/client_metadata/session_id"),
     ]
@@ -187,12 +186,20 @@ mod tests {
 
     #[test]
     fn affinity_uses_first_nonempty_string() {
-        let body = json!({"prompt_cache_key":" parent ","client_metadata":{"thread_id":"child"}});
+        let body = json!({"conversation_params":{"conversation_id":" parent "},"client_metadata":{"thread_id":"child"}});
         assert_eq!(body_affinity(&body), Some("parent"));
         assert_eq!(
-            body_affinity(&json!({"prompt_cache_key":" ","client_metadata":{"thread_id":"child"}})),
+            body_affinity(
+                &json!({"conversation_params":{"conversation_id":" "},"client_metadata":{"thread_id":"child"}})
+            ),
             Some("child")
         );
-        assert_eq!(body_affinity(&json!({"prompt_cache_key":false})), None);
+        for cache_key in [
+            json!("support-bot-v3"),
+            json!("x".repeat(257)),
+            json!(false),
+        ] {
+            assert_eq!(body_affinity(&json!({"prompt_cache_key":cache_key})), None);
+        }
     }
 }

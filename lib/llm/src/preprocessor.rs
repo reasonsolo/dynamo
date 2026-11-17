@@ -3938,6 +3938,9 @@ impl OpenAIPreprocessor {
         request: &R,
         stop_conditions: &mut crate::protocols::common::StopConditions,
     ) -> Result<()> {
+        if stop_conditions.ignore_eos.unwrap_or(false) {
+            return Ok(());
+        }
         if request.get_parallel_tool_calls() == Some(false)
             && Self::request_has_effective_tools(request)
             && request
@@ -3947,18 +3950,24 @@ impl OpenAIPreprocessor {
                 != Some("none")
             && self
                 .runtime_config
-                .get_engine_specific::<bool>(
-                    crate::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY,
-                )?
-                .unwrap_or(false)
+                .runtime_data
+                .get(crate::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
         {
-            let boundary = match self.tool_call_parser.as_deref() {
-                Some("kimi_k3" | "kimi-k3") => Some("<|close|>call<|sep|>"),
-                Some("glm4" | "glm47") => Some("</tool_call>"),
-                _ => None,
+            let boundaries: &[&str] = match self.tool_call_parser.as_deref() {
+                Some("kimi_k3" | "kimi-k3") => &["<|close|>call<|sep|>", "<|close|> call <|sep|>"],
+                Some("glm4" | "glm47") => &["</tool_call>"],
+                _ if self.uses_glm_parser() => &["</tool_call>"],
+                _ => &[],
             };
-            if let Some(boundary) = boundary {
-                stop_conditions.stop_visible = Some(vec![boundary.to_string()]);
+            if !boundaries.is_empty() {
+                stop_conditions.stop_visible = Some(
+                    boundaries
+                        .iter()
+                        .map(|boundary| (*boundary).to_string())
+                        .collect(),
+                );
             }
         }
         Ok(())
@@ -4084,6 +4093,14 @@ impl OpenAIPreprocessor {
             .map(|(prompt, _)| prompt)
     }
 
+    fn incomplete_glm_tool_call_errors(&self) -> bool {
+        self.runtime_config
+            .runtime_data
+            .get(crate::local_model::runtime_config::INCOMPLETE_GLM_TOOL_CALL_ERRORS_CAPABILITY)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    }
+
     fn uses_glm_parser(&self) -> bool {
         crate::protocols::openai::chat_completions::unified_parser::configured_family(
             self.tool_call_parser.as_deref(),
@@ -4191,18 +4208,29 @@ impl OpenAIPreprocessor {
             None => (None, None),
         };
         // GLM templates that ignore the toggle must not silently accept thinking-off.
-        if self.uses_glm_parser()
+        if request.should_add_generation_prompt()
+            && self.uses_glm_parser()
+            && self
+                .runtime_config
+                .runtime_data
+                .get(crate::local_model::runtime_config::STRICT_GLM_THINKING_OFF_CAPABILITY)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
             && Self::normalize_thinking_aliases(
                 request.chat_template_args(),
                 self.runtime_config.reasoning_parser.as_deref(),
             ) == Some(false)
-            && !formatted_prompt
+            && formatted_prompt
                 .as_ref()
-                .is_some_and(|prompt| prompt.as_str().trim_end().ends_with("</think>"))
+                .is_some_and(|prompt| !prompt.as_str().trim_end().ends_with("</think>"))
         {
-            return Err(invalid_argument_error(
-                "The selected GLM chat template does not render a closed reasoning prefill for thinking-off. Remove the reasoning-off setting or use a template that supports it.",
-            ));
+            let message = "The selected GLM chat template does not render a closed reasoning prefill for thinking-off. Remove the reasoning-off setting or use a template that supports it.";
+            return Err(DynamoError::builder()
+                .error_type(ErrorType::InvalidArgument)
+                .message(message)
+                .public_message(message)
+                .build()
+                .into());
         }
         let mut prefill = Self::prompt_reasoning_prefill_at_boundary(
             self.tool_call_parser.as_deref(),
@@ -6107,6 +6135,7 @@ impl OpenAIPreprocessor {
                 reasoning_disabled,
                 structured_response: Self::has_structured_response_format(request),
                 multiple_choices: request.inner.n.unwrap_or(1) > 1,
+                incomplete_glm_tool_call_errors: self.incomplete_glm_tool_call_errors(),
             };
             let prefill = policy.resolve_stream_prefill(
                 family,
@@ -6292,6 +6321,7 @@ impl OpenAIPreprocessor {
                     tool_definitions,
                     uses_tool_call_structural_tag,
                     guided_tool_streaming,
+                    self.incomplete_glm_tool_call_errors(),
                     stream,
                 ))
             }
@@ -6875,6 +6905,7 @@ impl OpenAIPreprocessor {
         tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
         uses_tool_call_structural_tag: bool,
         guided_streaming: bool,
+        incomplete_glm_tool_call_errors: bool,
         stream: S,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
     where
@@ -6929,6 +6960,7 @@ impl OpenAIPreprocessor {
         struct ChoiceRecovery {
             input_text: String,
             emitted_text: String,
+            terminal_received: bool,
         }
         let is_glm47 = tool_call_parser.as_deref() == Some("glm47");
         let glm47_config = dynamo_parsers::tool_calling::config::Glm47ParserConfig::default();
@@ -7032,9 +7064,10 @@ impl OpenAIPreprocessor {
                     .lock()
                     .expect("choice recovery buffer poisoned");
                 for choice in &data.inner.choices {
+                    let state = recovery.entry(choice.index).or_default();
+                    state.terminal_received |= choice.finish_reason.is_some();
                     if let Some(ChatCompletionMessageContent::Text(content)) = &choice.delta.content
                     {
-                        let state = recovery.entry(choice.index).or_default();
                         state.input_text.push_str(content);
                         // A completed call is already owned by the jail. Retain only
                         // the suffix after it, so terminal recovery examines the
@@ -7119,8 +7152,16 @@ impl OpenAIPreprocessor {
         };
         let pending_out = Arc::clone(&pending);
         let pending_eof = Arc::clone(&pending);
-        let parser_error = Arc::clone(&terminal_error);
+        let choice_recovery_eof =
+            (is_glm47 && incomplete_glm_tool_call_errors).then(|| Arc::clone(&choice_recovery));
+        let glm_protocol_error =
+            (is_glm47 && incomplete_glm_tool_call_errors).then(|| Arc::new(Mutex::new(None)));
+        let parser_error = glm_protocol_error.clone();
+        let mut glm_failed = false;
         let jailed_output = jailed.flat_map(move |mut a| {
+            if glm_failed {
+                return futures::stream::iter(None);
+            }
             debug_assert!(
                 a.error.is_none(),
                 "dynamo-parsers must not construct errors"
@@ -7180,16 +7221,26 @@ impl OpenAIPreprocessor {
                     let state = recovery.entry(choice.index).or_default();
                     if let Some(marker_start) = crate::protocols::openai::chat_completions::unified_parser::unquoted_native_tool_call_marker_or_prefix_start(&state.input_text, "glm47") {
                         let desired_content = &state.input_text[..marker_start];
-                        if matches!(choice.finish_reason, Some(
+                        if (matches!(choice.finish_reason, Some(
                             dynamo_protocols::types::FinishReason::Stop
                             | dynamo_protocols::types::FinishReason::ToolCalls
-                        )) && choice.delta.tool_calls.is_none()
+                        )) || (incomplete_glm_tool_call_errors && !state.terminal_received && choice.finish_reason.is_some()))
+                            && choice.delta.tool_calls.is_none()
                             && crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47").is_some()
                         {
-                            parser_error.lock().expect("jail terminal error poisoned").get_or_insert_with(||
-                                Annotated::from_err(crate::protocols::openai::chat_completions::unified_parser::incomplete_tool_call_error())
+                            let replacement = desired_content.strip_prefix(&state.emitted_text).unwrap_or_default();
+                            choice.delta.content = (!replacement.is_empty()).then(||
+                                ChatCompletionMessageContent::Text(replacement.to_string())
                             );
-                            return futures::stream::iter(std::iter::once(nv_chunk));
+                            choice.finish_reason = if let Some(parser_error) = &parser_error {
+                                glm_failed = true;
+                                parser_error.lock().expect("GLM protocol error poisoned").get_or_insert_with(||
+                                    Annotated::from_err(crate::protocols::openai::chat_completions::unified_parser::incomplete_tool_call_error())
+                                );
+                                None
+                            } else {
+                                Some(dynamo_protocols::types::FinishReason::Length)
+                            };
                         }
                         if choice.finish_reason == Some(dynamo_protocols::types::FinishReason::Length)
                             && crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47").is_some()
@@ -7225,7 +7276,7 @@ impl OpenAIPreprocessor {
                 }
             }
 
-            futures::stream::iter(std::iter::once(nv_chunk))
+            futures::stream::iter(Some(nv_chunk))
         });
 
         // Once an upstream error is latched, drop any output the jail synthesized
@@ -7252,6 +7303,38 @@ impl OpenAIPreprocessor {
                     .expect("jail terminal error poisoned")
                     .take()
             };
+            let mut terminal_error = terminal_error.or_else(|| {
+                glm_protocol_error.as_ref().and_then(|error| error.lock().expect("GLM protocol error poisoned").take())
+            });
+            if terminal_error.is_none() && let Some(recovery) = &choice_recovery_eof {
+                let mut prefixes = {
+                    let recovery = recovery.lock().expect("choice recovery buffer poisoned");
+                    recovery.iter().filter_map(|(&index, state)| {
+                        if state.terminal_received { return None; }
+                        let marker = crate::protocols::openai::chat_completions::unified_parser::first_unquoted_native_tool_call_marker(&state.input_text, "glm47")?;
+                        let prefix = state.input_text[..marker].strip_prefix(&state.emitted_text).unwrap_or_default();
+                        Some((index, prefix.to_string()))
+                    }).collect::<Vec<_>>()
+                };
+                prefixes.sort_unstable_by_key(|(index, _)| *index);
+                if !prefixes.is_empty() {
+                    let template = pending_eof.lock().expect("jail Dynamo metadata buffer poisoned").response_template.clone();
+                    for (index, prefix) in prefixes {
+                        if prefix.is_empty() { continue; }
+                        if let Some(mut inner) = template.clone() {
+                            let mut choice = empty_choice(index);
+                            choice.delta.content = Some(ChatCompletionMessageContent::Text(prefix));
+                            inner.choices = vec![choice];
+                            inner.usage = None;
+                            yield Annotated::from_data(NvCreateChatCompletionStreamResponse {
+                                message_boundary: None, inner, nvext: None, prompt_logprobs: None,
+                                llm_metrics: None, tool_call_completion: Vec::new(), model_eos: Vec::new(),
+                            });
+                        }
+                    }
+                    terminal_error = Some(Annotated::from_err(crate::protocols::openai::chat_completions::unified_parser::incomplete_tool_call_error()));
+                }
+            }
             if let Some(error) = terminal_error {
                 {
                     let mut p = pending_eof
@@ -8881,6 +8964,8 @@ impl
                     options.tool_choice = request.inner.tool_choice.clone();
                     options.guided_tool_constraint = guided_tool_constraint.clone();
                     options.parallel_tool_calls = request.inner.parallel_tool_calls;
+                    options.incomplete_glm_tool_call_errors =
+                        self.incomplete_glm_tool_call_errors();
                     options
                         .with_tool_call_parsing_enabled(Self::tool_call_parsing_enabled(&request))
                         .with_move_reasoning_to_content_when_empty(
@@ -10096,6 +10181,13 @@ mod tests {
             let mut preprocessor = extra_args_media_copy_tests::test_preprocessor();
             preprocessor.formatter = test_prompt_formatter(CLOSED);
             preprocessor.tool_call_parser = tool.map(str::to_owned);
+            preprocessor
+                .runtime_config
+                .set_engine_specific(
+                    crate::local_model::runtime_config::STRICT_GLM_THINKING_OFF_CAPABILITY,
+                    true,
+                )
+                .unwrap();
             preprocessor.runtime_config.reasoning_parser = Some("glm45".into());
             for controls in [
                 serde_json::json!({"chat_template_kwargs": {"thinking": false}}),
@@ -10121,6 +10213,13 @@ mod tests {
                         ErrorType::InvalidArgument
                     );
                     assert!(error.to_string().contains("closed reasoning prefill"));
+                    assert!(
+                        error
+                            .downcast_ref::<DynamoError>()
+                            .unwrap()
+                            .public_message()
+                            .is_some_and(|message| message.contains("closed reasoning prefill"))
+                    );
                 }
                 preprocessor.formatter = test_prompt_formatter(CLOSED);
                 let reasoning_disabled = OpenAIPreprocessor::request_disables_reasoning_with_family(
@@ -10173,6 +10272,44 @@ mod tests {
                 .unwrap();
             let (_, prefill) = preprocessor.apply_template_and_prefill(&request).unwrap();
             assert!(prefill.unified);
+        }
+    }
+
+    #[test]
+    fn glm_thinking_off_admission_requires_capability_and_generation_prompt() {
+        let mut preprocessor = extra_args_media_copy_tests::test_preprocessor();
+        preprocessor.tool_call_parser = Some("glm47".into());
+        preprocessor.runtime_config.reasoning_parser = Some("glm45".into());
+        preprocessor.formatter = test_prompt_formatter(
+            "{% for m in messages %}{{ m.content }}{% endfor %}<|assistant|>\n<think>",
+        );
+        for (capability, generation, continued, rejects) in [
+            (None, true, false, false),
+            (Some(serde_json::json!("true")), true, false, false),
+            (Some(serde_json::json!(true)), true, false, true),
+            (Some(serde_json::json!(true)), false, false, false),
+            (Some(serde_json::json!(true)), true, true, false),
+        ] {
+            let key = crate::local_model::runtime_config::STRICT_GLM_THINKING_OFF_CAPABILITY;
+            preprocessor.runtime_config.runtime_data.remove(key);
+            if let Some(value) = capability {
+                preprocessor
+                    .runtime_config
+                    .runtime_data
+                    .insert(key.into(), value);
+            }
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(serde_json::json!({
+                    "model":"test", "messages":[{"role":"assistant", "content":"prefill"}],
+                    "chat_template_kwargs":{"thinking":false},
+                    "add_generation_prompt":generation && !continued,
+                    "continue_final_message":continued
+                }))
+                .unwrap();
+            assert_eq!(
+                preprocessor.apply_template_and_prefill(&request).is_err(),
+                rejects
+            );
         }
     }
 
@@ -13003,6 +13140,7 @@ responses_tools: None,
             None,
             false,
             false,
+            true,
             stream::iter(vec![chunk]),
         )
         .collect::<Vec<_>>()
@@ -13045,6 +13183,7 @@ responses_tools: None,
             None,
             false,
             false,
+            true,
             stream::iter(vec![finish, eos]),
         )
         .collect::<Vec<_>>()
@@ -13103,6 +13242,7 @@ responses_tools: None,
             None,
             false,
             false,
+            true,
             stream::iter(chunks.into_iter().enumerate().map(move |(index, content)| {
                 glm47_stream_chunk(&content, (index + 1 == chunk_count).then_some(terminal))
             })),
@@ -13205,6 +13345,39 @@ responses_tools: None,
         for split in input.char_indices().map(|(index, _)| index).skip(1) {
             let output = apply_glm47_streaming_length(&[&input[..split], &input[split..]]).await;
             assert_glm47_streaming_length_output(&output, "I can help. ", split);
+        }
+    }
+
+    #[tokio::test]
+    async fn glm47_legacy_errors_require_capability_and_preserve_terminal_prefix() {
+        for strict in [false, true] {
+            for finish in [None, Some(FinishReason::Stop), Some(FinishReason::Length)] {
+                let output = OpenAIPreprocessor::apply_tool_calling_jail(
+                    Some("glm47".to_string()),
+                    None,
+                    None,
+                    false,
+                    false,
+                    strict,
+                    stream::iter([glm47_stream_chunk("I'll check. <tool_call>ipy", finish)]),
+                )
+                .collect::<Vec<_>>()
+                .await;
+                assert_eq!(stream_content(&output), "I'll check. ");
+                assert_eq!(
+                    output.iter().any(|chunk| chunk.error.is_some()),
+                    strict && finish != Some(FinishReason::Length)
+                );
+                if strict && finish != Some(FinishReason::Length) {
+                    assert!(
+                        output
+                            .iter()
+                            .flat_map(|chunk| chunk.data.iter())
+                            .flat_map(|chunk| &chunk.inner.choices)
+                            .all(|choice| choice.finish_reason.is_none())
+                    );
+                }
+            }
         }
     }
 
@@ -13568,9 +13741,74 @@ responses_tools: None,
                         supported && parallel == Some(false) && choice != "none"
                     );
                     if let Some(stops) = stops.stop_visible {
-                        assert_eq!(stops, ["<|close|>call<|sep|>"]);
+                        assert_eq!(stops, ["<|close|>call<|sep|>", "<|close|> call <|sep|>"]);
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_visible_stop_capability_is_absent() {
+        let mut preprocessor = hidden_stop_preprocessor();
+        preprocessor.tool_call_parser = Some("kimi_k3".into());
+        preprocessor.runtime_config.runtime_data.insert(
+            crate::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY.into(),
+            serde_json::json!("true"),
+        );
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"m", "messages":[{"role":"user","content":"test"}],
+            "tools":[{"type":"function","function":{"name":"exec","parameters":{"type":"object"}}}],
+            "parallel_tool_calls":false
+        }))
+        .unwrap();
+        let mut stops = crate::protocols::common::StopConditions::default();
+        preprocessor
+            .apply_single_tool_call_stop(&request, &mut stops)
+            .unwrap();
+        assert!(stops.stop_visible.is_none());
+    }
+
+    #[test]
+    fn single_call_boundary_respects_ignore_eos_and_resolved_glm_family() {
+        use crate::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY;
+        let mut preprocessor = hidden_stop_preprocessor();
+        preprocessor
+            .runtime_config
+            .set_engine_specific(VISIBLE_STOP_STRINGS_CAPABILITY, true)
+            .unwrap();
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "test"}],
+            "tools": [{"type": "function", "function": {"name": "exec", "parameters": {"type": "object"}}}],
+            "parallel_tool_calls": false
+        })).unwrap();
+        for (tool_parser, reasoning_parser, boundary) in [
+            (Some("kimi_k3"), None, "<|close|>call<|sep|>"),
+            (Some("glm4"), None, "</tool_call>"),
+            (Some("glm47"), None, "</tool_call>"),
+            (None, Some("glm45"), "</tool_call>"),
+        ] {
+            preprocessor.tool_call_parser = tool_parser.map(str::to_string);
+            preprocessor.runtime_config.reasoning_parser = reasoning_parser.map(str::to_string);
+            for ignore_eos in [None, Some(false), Some(true)] {
+                let mut stops = crate::protocols::common::StopConditions {
+                    ignore_eos,
+                    ..Default::default()
+                };
+                preprocessor
+                    .apply_single_tool_call_stop(&request, &mut stops)
+                    .unwrap();
+                assert_eq!(
+                    stops.stop_visible,
+                    (ignore_eos != Some(true)).then(|| {
+                        if tool_parser == Some("kimi_k3") {
+                            vec![boundary.to_string(), "<|close|> call <|sep|>".to_string()]
+                        } else {
+                            vec![boundary.to_string()]
+                        }
+                    }),
+                    "{tool_parser:?}/{reasoning_parser:?}/{ignore_eos:?}"
+                );
             }
         }
     }
@@ -13593,6 +13831,7 @@ responses_tools: None,
             false,
             // No tools and no forced choice, so no JSON grammar was installed.
             false,
+            true,
             stream::iter(vec![
                 kimi_k3_reasoning_chunk(leaked_reasoning),
                 terminal_chat_stream_chunk(),
@@ -13643,6 +13882,7 @@ responses_tools: None,
             Some(tool_definitions),
             false,
             false,
+            true,
             stream::iter(vec![
                 kimi_k3_reasoning_chunk(leaked_reasoning),
                 terminal_chat_stream_chunk(),
@@ -15836,6 +16076,13 @@ responses_tools: None,
     async fn glm_generation_reasoning_follows_rendered_prompt() {
         for parser in ["glm45", "glm47"] {
             let mut preprocessor = Arc::try_unwrap(mock_llama_preprocessor()).ok().unwrap();
+            preprocessor
+                .runtime_config
+                .set_engine_specific(
+                    crate::local_model::runtime_config::STRICT_GLM_THINKING_OFF_CAPABILITY,
+                    true,
+                )
+                .unwrap();
             preprocessor.runtime_config.reasoning_parser = Some(parser.into());
             preprocessor.tool_call_parser = Some("glm47".into());
             for (tail, reasoning_open) in [
@@ -15923,6 +16170,13 @@ responses_tools: None,
     #[tokio::test]
     async fn glm_unknown_prompt_reasoning_preserves_request_controls() {
         let mut preprocessor = Arc::try_unwrap(mock_llama_preprocessor()).ok().unwrap();
+        preprocessor
+            .runtime_config
+            .set_engine_specific(
+                crate::local_model::runtime_config::STRICT_GLM_THINKING_OFF_CAPABILITY,
+                true,
+            )
+            .unwrap();
         preprocessor.runtime_config.reasoning_parser = Some("glm45".into());
         preprocessor.tool_call_parser = Some("glm47".into());
         for (tail, add_generation_prompt) in [
@@ -15942,10 +16196,8 @@ responses_tools: None,
                     }))
                     .unwrap();
                 let result = preprocessor.preprocess_request(&request, None).await;
-                if !requested && !tail.trim_end().ends_with("</think>") {
-                    let error = result
-                        .err()
-                        .expect("unknown thinking-off prefill must fail");
+                if add_generation_prompt && !requested && !tail.trim_end().ends_with("</think>") {
+                    let error = result.err().expect("unknown thinking-off prefill must fail");
                     let error = error.downcast_ref::<DynamoError>().unwrap();
                     assert_eq!(error.error_type(), ErrorType::InvalidArgument);
                     assert!(

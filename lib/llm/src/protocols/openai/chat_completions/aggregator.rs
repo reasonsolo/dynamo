@@ -784,6 +784,19 @@ impl DeltaAggregator {
                             aggregator.response_events = parsed.events;
                         }
                         if parsed.incomplete_native_call
+                            && parsing_options.incomplete_glm_tool_call_errors
+                            && family == super::unified_parser::GLM47_UNIFIED_FAMILY
+                            && matches!(
+                                choice.finish_reason,
+                                None | Some(
+                                    dynamo_protocols::types::FinishReason::Stop
+                                        | dynamo_protocols::types::FinishReason::ToolCalls
+                                )
+                            )
+                        {
+                            return Err(super::unified_parser::incomplete_tool_call_error());
+                        }
+                        if parsed.incomplete_native_call
                             && matches!(
                                 choice.finish_reason,
                                 Some(
@@ -792,9 +805,6 @@ impl DeltaAggregator {
                                 )
                             )
                         {
-                            if family == super::unified_parser::GLM47_UNIFIED_FAMILY {
-                                return Err(super::unified_parser::incomplete_tool_call_error());
-                            }
                             choice.finish_reason =
                                 Some(dynamo_protocols::types::FinishReason::Length);
                         }
@@ -866,9 +876,10 @@ impl DeltaAggregator {
                 )
                 .await;
                 if parser == "glm47"
+                    && parsing_options.incomplete_glm_tool_call_errors
                     && matches!(
                         choice.finish_reason,
-                        Some(
+                        None | Some(
                             dynamo_protocols::types::FinishReason::Stop
                                 | dynamo_protocols::types::FinishReason::ToolCalls
                         )
@@ -3974,46 +3985,68 @@ mod tests {
 
     #[tokio::test]
     async fn test_glm47_single_truncated_call_is_suppressed() {
-        let text = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Bos";
-        for reason in [
-            dynamo_protocols::types::FinishReason::Length,
-            dynamo_protocols::types::FinishReason::Stop,
-            dynamo_protocols::types::FinishReason::ToolCalls,
-        ] {
-            let delta = create_test_delta(
-                0,
-                text,
-                Some(dynamo_protocols::types::Role::Assistant),
-                Some(reason),
+        use dynamo_protocols::types::FinishReason;
+        let text = "I'll check. <tool_call>get_weather<arg_key>city</arg_key><arg_value>Bos";
+        for strict in [false, true] {
+            for reason in [
                 None,
-                None,
-            );
-            let stream = Box::pin(stream::iter(vec![delta]));
-            let result = DeltaAggregator::apply(
-                stream,
-                ParsingOptions::new(Some("glm47".to_string()), None),
-            )
-            .await;
-            if reason != dynamo_protocols::types::FinishReason::Length {
-                assert_eq!(
-                    result.unwrap_err().class(),
-                    dynamo_runtime::error::ErrorClass::BackendProtocol
+                Some(FinishReason::Length),
+                Some(FinishReason::Stop),
+                Some(FinishReason::ToolCalls),
+            ] {
+                let delta = create_test_delta(
+                    0,
+                    text,
+                    Some(dynamo_protocols::types::Role::Assistant),
+                    reason,
+                    None,
+                    None,
                 );
-                continue;
+                let other = create_test_delta(
+                    1,
+                    "other choice",
+                    Some(dynamo_protocols::types::Role::Assistant),
+                    Some(FinishReason::Stop),
+                    None,
+                    None,
+                );
+                let result = DeltaAggregator::apply(
+                    Box::pin(stream::iter(vec![delta, other])),
+                    ParsingOptions::new(Some("glm47".to_string()), None)
+                        .with_incomplete_glm_tool_call_errors(strict),
+                )
+                .await;
+                if strict && reason != Some(FinishReason::Length) {
+                    assert_eq!(
+                        result.unwrap_err().class(),
+                        dynamo_runtime::error::ErrorClass::BackendProtocol
+                    );
+                    continue;
+                }
+                let result = result.unwrap();
+                let choice = &result.inner.choices[0];
+                if reason.is_some() {
+                    assert_eq!(choice.finish_reason, Some(FinishReason::Length));
+                }
+                assert!(choice.message.tool_calls.is_none());
+                assert_eq!(
+                    choice.message.content,
+                    Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                        "I'll check. ".into()
+                    ))
+                );
+                assert_eq!(
+                    result.inner.choices[1].message.content,
+                    Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                        "other choice".into()
+                    ))
+                );
+                assert!(
+                    !serde_json::to_string(choice)
+                        .unwrap()
+                        .contains("<tool_call>")
+                );
             }
-            let result = result.unwrap();
-
-            let choice = &result.inner.choices[0];
-            assert_eq!(
-                choice.finish_reason,
-                Some(dynamo_protocols::types::FinishReason::Length)
-            );
-            assert!(
-                choice.message.tool_calls.is_none(),
-                "incomplete call must not produce a structured tool_call"
-            );
-            assert_eq!(choice.message.content, None);
-            assert!(!serde_json::to_string(choice).unwrap().contains(text));
         }
     }
 

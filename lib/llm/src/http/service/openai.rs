@@ -549,7 +549,6 @@ fn is_context_length_error(response: &ErrorResponse) -> bool {
         || (message.contains("input length")
             && message.contains("max_seq_len")
             && message.contains("exceed"))
-        || (message.contains("max sequence length (") && message.contains("exceeds max_seq_len ("))
 }
 
 fn responses_overflow_stream(
@@ -566,14 +565,17 @@ fn responses_overflow_stream(
     let mut events = converter.emit_start_events();
     events.extend(converter.emit_error_events(ResponseError {
         misalignment: None,
-        code: responses_error_code(error),
+        code: responses_error_code(error, true),
         message: error.1.message.clone(),
     }));
     Sse::new(stream::iter(events)).into_response()
 }
 
-fn responses_error_code(response: &ErrorResponse) -> ResponseErrorCode {
-    if is_context_length_error(response) {
+fn responses_error_code(
+    response: &ErrorResponse,
+    context_overflow_events: bool,
+) -> ResponseErrorCode {
+    if context_overflow_events && is_context_length_error(response) {
         return ResponseErrorCode::Other("context_length_exceeded".into());
     }
     match response.0 {
@@ -4308,37 +4310,20 @@ async fn chat_completions(
         return Err(err_response);
     }
 
-    if super::image_omission::should_omit_images(&state, &model) {
-        super::image_omission::omit_chat_images(&mut request.inner.messages);
-    }
-
     if let Err(err_response) = reject_media_if_configured(&state, &request) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
-
-    tracing::trace!("Getting chat completions engine for model: {}", model);
-
-    // Selected once: the Beam request normalization below reads this engine's parsing
-    // options and dispatch uses this same engine, so the two cannot disagree on the
-    // worker set when one served name fronts Beam and non-Beam pools.
-    // The lookup sits inside validation, so this range nests in
-    // frontend.http.chat.validate, whose duration includes it.
+    // Selected once for capability admission, media policy, and dispatch.
     let nvtx_lookup = dynamo_nvtx_range!("frontend.http.chat.engine_lookup");
-    // Text-input WorkerSets never run the preprocessor gate, so admit custom
-    // content only where a WorkerSet advertises it.
-    let (engine, parsing_options) = if crate::preprocessor::has_custom_content(request.content()) {
-        state
-            .manager()
-            .get_chat_completions_engine_with_parsing_for_capability(
-                &model,
-                crate::local_model::runtime_config::JSON_MULTIMODAL_CAPABILITY,
-            )
+    let engine_selection = if crate::preprocessor::has_custom_content(request.content()) {
+        super::image_omission::select_chat_engine_for_capability(
+            &state,
+            &model,
+            crate::local_model::runtime_config::JSON_MULTIMODAL_CAPABILITY,
+        )
     } else {
-        state
-            .manager()
-            .get_chat_completions_engine_with_parsing(&model)
-            .map(Some)
+        super::image_omission::select_chat_engine(&state, &model).map(Some)
     }
     .map_err(|e| ErrorMessage::from_model_error(&e))
     .and_then(|selected| {
@@ -4353,6 +4338,12 @@ async fn chat_completions(
         inflight_guard.mark_error(extract_error_type_from_response(err_response));
     })?;
     drop(nvtx_lookup);
+    if engine_selection.2 {
+        super::image_omission::omit_chat_images(&mut request.inner.messages);
+    }
+
+    tracing::trace!("Getting chat completions engine for model: {}", model);
+    let (engine, parsing_options, _) = engine_selection;
 
     // Beam route, before generic validation (which rejects what this normalizes): a
     // legacy `builtin_tools` declaration is promoted into `tools` (see
@@ -4925,7 +4916,7 @@ async fn handler_responses(
     body: Body,
 ) -> Result<Response, ErrorResponse> {
     let body = read_json_request_body(&headers, body).await?;
-    let mut body_value: serde_json::Value = parse_json_request("responses", &body)?;
+    let UniqueJsonValue(mut body_value) = parse_json_request("responses", &body)?;
     crate::protocols::openai::responses::request_compat::hoist_additional_tools(&mut body_value)
         .map_err(|error| responses_conversion_error_response(error.into()))?;
     let body_affinity =
@@ -5087,15 +5078,15 @@ async fn responses(
         return Err(err_response);
     }
 
-    if super::image_omission::should_omit_images(&state, &model) {
-        super::image_omission::omit_response_images(&mut request.inner.input);
-    }
-
     if let Err(err_response) = reject_media(media_refusal_for_content_type(&state, || {
         responses_media_content_type(&request)
     })) {
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
+    }
+    let engine_selection = super::image_omission::select_chat_engine(&state, &model);
+    if engine_selection.as_ref().is_ok_and(|(_, _, omit)| *omit) {
+        super::image_omission::omit_response_images(&mut request.inner.input);
     }
 
     // Extract request parameters before into_parts() consumes the request.
@@ -5197,14 +5188,13 @@ async fn responses(
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
 
-    let (engine, parsing_options) = state
-        .manager()
-        .get_chat_completions_engine_with_parsing(&model)
-        .map_err(|e| {
-            let err_response = ErrorMessage::from_model_error(&e);
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-            err_response
-        })?;
+    let (engine, parsing_options, _) = engine_selection.map_err(|e| {
+        let err_response = ErrorMessage::from_model_error(&e);
+        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
+
+    let context_overflow_events = parsing_options.responses_context_overflow_events;
 
     if matches!(
         parsing_options.tool_call_parser.as_deref(),
@@ -5305,7 +5295,7 @@ async fn responses(
     });
     let engine_stream = match engine_stream {
         Ok(stream) => stream,
-        Err(error) if streaming && is_context_length_error(&error) => {
+        Err(error) if streaming && context_overflow_events && is_context_length_error(&error) => {
             return Ok(responses_overflow_stream(
                 model,
                 response_params,
@@ -5335,7 +5325,7 @@ async fn responses(
         });
         let engine_stream = match engine_stream {
             Ok(stream) => stream,
-            Err(error) if is_context_length_error(&error) => {
+            Err(error) if context_overflow_events && is_context_length_error(&error) => {
                 return Ok(responses_overflow_stream(
                     model,
                     response_params,
@@ -5394,7 +5384,7 @@ async fn responses(
                         }
                         backend_error = Some(ResponseError {
                             misalignment: None,
-                            code: responses_error_code(&error_response),
+                            code: responses_error_code(&error_response, context_overflow_events),
                             message: error_response.1.message.clone(),
                         });
                     }
@@ -6990,14 +6980,29 @@ pub fn audios_router(
 mod tests {
     #[tokio::test]
     async fn context_overflow_is_a_typed_failed_sse_response() {
-        let error = ErrorMessage::from_anyhow(
-            crate::protocols::common::invalid_argument_error(
-                "Max sequence length (100) exceeds max_seq_len (64). Truncate the input or increase max_seq_len.",
-            ),
-            "validation failed",
-        );
+        let event: Annotated<NvCreateChatCompletionStreamResponse> = Annotated {
+            event: Some("error".to_string()),
+            comment: Some(vec![
+                r#"{"code":400,"message":"Input length (100) exceeds max_seq_len (64). private backend diagnostic"}"#.into(),
+            ]),
+            data: None,
+            id: None,
+            error: None,
+        };
+        let backend_error = extract_backend_error_if_present(&event).unwrap();
+        let error = backend_error_response(backend_error, false);
+        assert_eq!(error.1.message, "Request exceeds the model context length");
+        assert_eq!(error.1.details.as_ref().unwrap()["type"], "context_length");
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
         assert!(is_context_length_error(&error));
+        assert_eq!(
+            responses_error_code(&error, false),
+            ResponseErrorCode::InvalidPrompt
+        );
+        assert_eq!(
+            responses_error_code(&error, true),
+            ResponseErrorCode::Other("context_length_exceeded".into())
+        );
         let response =
             responses_overflow_stream("m".into(), ResponseParams::default(), None, &error);
         assert_eq!(response.status(), StatusCode::OK);
@@ -7057,6 +7062,32 @@ mod tests {
     }
 
     #[test]
+    fn cache_and_correlation_hints_do_not_establish_session_affinity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-correlation-id", "gateway-request-id".parse().unwrap());
+        for conversation in [None, Some("conversation")] {
+            let body = serde_json::json!({
+                "prompt_cache_key": "x".repeat(257),
+                "conversation_params": {"conversation_id": conversation}
+            });
+            let affinity =
+                crate::protocols::openai::responses::request_compat::body_affinity(&body)
+                    .map(str::to_owned);
+            let mut request =
+                context_from_headers(NvCreateResponse::default(), "r".into(), &headers).unwrap();
+            apply_responses_body_affinity(&mut request, &headers, affinity, conversation.is_some());
+            assert_eq!(
+                request
+                    .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                    .ok()
+                    .as_deref()
+                    .map(SessionAffinityId::as_str),
+                conversation
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_invalid_arguments_are_not_context_overflows() {
         let error = ErrorMessage::from_anyhow(
             crate::protocols::common::invalid_argument_error("temperature must be nonnegative"),
@@ -7064,7 +7095,7 @@ mod tests {
         );
         assert!(!is_context_length_error(&error));
         assert_eq!(
-            responses_error_code(&error),
+            responses_error_code(&error, true),
             ResponseErrorCode::InvalidPrompt
         );
     }

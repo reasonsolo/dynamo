@@ -132,6 +132,20 @@ response provides them, and compare it against `message.content` and
 `message.tool_calls` to decide whether the issue is in the model output,
 the parser configuration, or the parser logic.
 
+## Custom-Tool Grammar Constraints
+
+The Responses endpoint accepts regex and Lark grammar descriptors for custom tools,
+including namespace members and tools returned by client-side tool search. These
+formats are **advisory** in Dynamo: the model receives a freeform `input` string,
+and the response echoes the descriptor, but decoding does not enforce the grammar.
+The frontend logs a warning once per process when it receives a custom-tool grammar.
+This differs from an endpoint that guarantees grammar-constrained custom-tool output.
+
+Validate each generated custom-tool input before executing the tool. If your client
+requires the endpoint to enforce a grammar, do not treat an HTTP 200 response or the
+echoed descriptor as proof of enforcement. Function-tool and response-format guided
+decoding use separate constraints; see [Structural Tags](structural-tag.md).
+
 ## Parser Generation Routing
 
 Set `DYN_PARSER_VERSION` on the frontend running the `dynamo` processor and on workers that build parser-dependent guidance. Workers publish `--dyn-tool-call-parser` and `--dyn-reasoning-parser`; the frontend runs parsing. Restart after changing the environment because version selection is cached. For release-specific parser versions, inspect `Cargo.toml` and `Cargo.lock` in your release checkout. The development [Cargo.toml](https://github.com/ai-dynamo/dynamo/blob/main/Cargo.toml) and [Cargo.lock](https://github.com/ai-dynamo/dynamo/blob/main/Cargo.lock) links track `main`. The frontend-crates library examples may target a newer release.

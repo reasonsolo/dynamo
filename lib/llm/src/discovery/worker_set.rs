@@ -450,6 +450,12 @@ impl WorkerSet {
     /// Build ParsingOptions from this WorkerSet's card configuration.
     pub fn parsing_options(&self) -> crate::protocols::openai::ParsingOptions {
         crate::protocols::openai::ParsingOptions {
+            incomplete_glm_tool_call_errors: self.card.runtime_config.runtime_data
+                .get(crate::local_model::runtime_config::INCOMPLETE_GLM_TOOL_CALL_ERRORS_CAPABILITY)
+                .and_then(serde_json::Value::as_bool) == Some(true),
+            responses_context_overflow_events: self.card.runtime_config.runtime_data
+                .get(crate::local_model::runtime_config::RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY)
+                .and_then(serde_json::Value::as_bool) == Some(true),
             default_thinking_mode: self
                 .card
                 .runtime_config

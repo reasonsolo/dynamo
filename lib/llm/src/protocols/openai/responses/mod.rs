@@ -1524,6 +1524,15 @@ impl ResponseParams {
             .is_some_and(|include| include.contains(&IncludeEnum::ReasoningEncryptedContent))
     }
 
+    fn reasoning_plaintext_enabled(&self) -> bool {
+        !self.reasoning_encrypted_content_requested()
+            || self
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.summary)
+                .is_some()
+    }
+
     fn reasoning_output_enabled(&self) -> bool {
         self.emit_backend_reasoning
             || self.reasoning_encrypted_content_requested()
@@ -1692,17 +1701,18 @@ pub fn chat_completion_to_response(
             && !reasoning_text.is_empty()
             && params.reasoning_output_enabled()
         {
+            let encrypted_content = params
+                .reasoning_encrypted_content_requested()
+                .then(|| reasoning_replay::encode(&reasoning_text));
             output.push(OutputItem::Reasoning(ReasoningItem {
                 id: Some(format!("rs_{}", Uuid::new_v4().simple())),
                 summary: vec![],
-                content: Some(vec![ReasoningItemContent::ReasoningText(
-                    ReasoningTextContent {
-                        text: reasoning_text.clone(),
-                    },
-                )]),
-                encrypted_content: params
-                    .reasoning_encrypted_content_requested()
-                    .then(|| reasoning_replay::encode(&reasoning_text)),
+                content: params.reasoning_plaintext_enabled().then(|| {
+                    vec![ReasoningItemContent::ReasoningText(ReasoningTextContent {
+                        text: reasoning_text,
+                    })]
+                }),
+                encrypted_content,
                 status: Some(OutputStatus::Completed),
             }));
         }
@@ -1853,17 +1863,18 @@ pub fn chat_completion_to_response(
                             &mut pending_scores,
                         );
                         if params.reasoning_output_enabled() && !reasoning.is_empty() {
+                            let encrypted_content = params
+                                .reasoning_encrypted_content_requested()
+                                .then(|| reasoning_replay::encode(&reasoning));
                             output.push(OutputItem::Reasoning(ReasoningItem {
                                 id: Some(format!("rs_{}", Uuid::new_v4().simple())),
                                 summary: vec![],
-                                content: Some(vec![ReasoningItemContent::ReasoningText(
-                                    ReasoningTextContent {
-                                        text: reasoning.clone(),
-                                    },
-                                )]),
-                                encrypted_content: params
-                                    .reasoning_encrypted_content_requested()
-                                    .then(|| reasoning_replay::encode(&reasoning)),
+                                content: params.reasoning_plaintext_enabled().then(|| {
+                                    vec![ReasoningItemContent::ReasoningText(
+                                        ReasoningTextContent { text: reasoning },
+                                    )]
+                                }),
+                                encrypted_content,
                                 status: Some(OutputStatus::Completed),
                             }));
                         }
@@ -4940,11 +4951,18 @@ mod tests {
 
     #[test]
     fn kimi_replay_restores_dropped_namespace_unless_model_used_a_bare_name() {
-        for (id, expected) in [("call_1", "functions.exec"), ("call_1_bare", "exec")] {
+        let marked = template_tools::encode_kimi_bare_call_id("call_1");
+        for (id, name, expected) in [
+            ("call_1", "exec", "functions.exec"),
+            (marked.as_str(), "exec", "exec"),
+            ("call_1_bare", "functions.exec", "functions.exec"),
+            ("call_1_bare", "exec", "functions.exec"),
+            ("dynamo_kimi_bare_v1_!", "functions.exec", "functions.exec"),
+        ] {
             let request: NvCreateResponse = serde_json::from_value(serde_json::json!({
                 "model":"m", "tools":[{"type":"namespace","name":"functions","tools":[
                     {"type":"function","name":"exec","parameters":{"type":"object"}}
-                ]}], "input":[{"type":"function_call","call_id":id,"name":"exec","arguments":"{}"}]
+                ]}], "input":[{"type":"function_call","call_id":id,"name":name,"arguments":"{}"}]
             }))
             .unwrap();
             let mut chat: NvCreateChatCompletionRequest = request.try_into().unwrap();
@@ -4981,32 +4999,40 @@ mod tests {
             preserve_tool_spelling: true,
             ..Default::default()
         };
-        let item = params
-            .tool_output(
-                "fc_1".into(),
-                "call_1".into(),
-                "exec",
-                "{}",
-                OutputStatus::Completed,
-            )
-            .unwrap();
-        let OutputItem::FunctionCall(call) = &item else {
-            panic!("missing function call");
-        };
-        assert_eq!(call.call_id, "call_1_bare");
-        assert_eq!(call.namespace.as_deref(), Some("functions"));
-        let mut body = serde_json::to_value(request).unwrap();
-        body["input"] = serde_json::json!([item]);
-        let replay: NvCreateResponse = serde_json::from_value(body).unwrap();
-        let mut chat: NvCreateChatCompletionRequest = replay.try_into().unwrap();
-        chat.normalize_kimi_replay().unwrap();
-        chat.normalize_responses_tools(true).unwrap();
-        let ChatCompletionRequestMessage::Assistant(assistant) = &chat.inner.messages[0] else {
-            panic!("missing assistant");
-        };
-        let call = &assistant.tool_calls.as_ref().unwrap()[0];
-        assert_eq!(call.function.name, "exec");
-        assert_eq!(call.id, "call_1_bare");
+        for original_id in ["call_1", "dynamo_kimi_bare_v1_Y2FsbF8x"] {
+            let item = params
+                .tool_output(
+                    "fc_1".into(),
+                    original_id.into(),
+                    "exec",
+                    "{}",
+                    OutputStatus::Completed,
+                )
+                .unwrap();
+            let OutputItem::FunctionCall(call) = &item else {
+                panic!("missing function call");
+            };
+            assert_eq!(
+                call.call_id,
+                template_tools::encode_kimi_bare_call_id(original_id)
+            );
+            assert_eq!(call.namespace.as_deref(), Some("functions"));
+            let mut body = serde_json::to_value(&request).unwrap();
+            body["input"] = serde_json::json!([item]);
+            let replay: NvCreateResponse = serde_json::from_value(body).unwrap();
+            let mut chat: NvCreateChatCompletionRequest = replay.try_into().unwrap();
+            chat.normalize_kimi_replay().unwrap();
+            chat.normalize_responses_tools(true).unwrap();
+            let ChatCompletionRequestMessage::Assistant(assistant) = &chat.inner.messages[0] else {
+                panic!("missing assistant");
+            };
+            let call = &assistant.tool_calls.as_ref().unwrap()[0];
+            assert_eq!(call.function.name, "exec");
+            assert_eq!(
+                call.id,
+                template_tools::encode_kimi_bare_call_id(original_id)
+            );
+        }
     }
 
     #[test]
@@ -5025,6 +5051,10 @@ mod tests {
         assert_eq!(
             item.encrypted_content.as_deref(),
             Some(reasoning_replay::encode(text).as_str())
+        );
+        assert!(
+            item.content.is_none(),
+            "encrypted-only output must not include plaintext"
         );
         let request: NvCreateResponse = serde_json::from_value(serde_json::json!({
             "model":"m", "input":[{"type":"reasoning", "summary":[], "encrypted_content":item.encrypted_content}]

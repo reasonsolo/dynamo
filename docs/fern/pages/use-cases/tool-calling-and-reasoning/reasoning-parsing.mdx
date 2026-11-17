@@ -112,6 +112,25 @@ Set `DYN_PARSER_VERSION` in the frontend and backend worker environments before 
   </Step>
 </Steps>
 
+## Responses Reasoning Replay
+
+For Responses requests, `include: ["reasoning.encrypted_content"]` without
+`reasoning.summary` returns reasoning replay data without plaintext reasoning
+content or `response.reasoning_text.*` events. When a summary is explicitly
+requested, the existing visible-reasoning output policy remains available.
+
+Dynamo's replay format is a versioned base64 encoding of UTF-8 reasoning,
+**not encryption**. Treat the blob as sensitive reasoning content. Replay accepts
+this owned format when readable content is absent; readable content takes
+precedence when both are supplied. This is a Dynamo compatibility extension,
+not a promise that provider-specific encrypted blobs can be decoded.
+
+For Kimi and GLM parser profiles, Dynamo also preserves backend reasoning as raw
+reasoning output when neither a summary nor encrypted content is requested.
+This differs from the [OpenAI reasoning guide](https://developers.openai.com/api/docs/guides/reasoning),
+which exposes an explicitly requested summary rather than raw reasoning tokens.
+Other parser profiles retain their existing opt-in output policy.
+
 ## Deployment-Level Thinking Default
 
 Set `--dyn-default-thinking-mode` on a backend worker to choose the thinking

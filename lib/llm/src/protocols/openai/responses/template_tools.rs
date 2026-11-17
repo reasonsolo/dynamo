@@ -3,6 +3,9 @@
 
 //! Native template metadata and custom/client-search protocol adaptation.
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use dynamo_protocols::types::responses::CustomToolParamFormat;
+
 use super::super::tools::custom_input_or_raw;
 use super::*;
 
@@ -22,6 +25,23 @@ pub struct ResponsesToolContext {
     pub(super) history_tool_names: HashMap<String, Vec<String>>,
     pub(super) tool_choice_name: Option<String>,
     pub(super) selected_tools: Option<HashSet<(Option<String>, String)>>,
+}
+
+const KIMI_BARE_CALL_ID_PREFIX: &str = "dynamo_kimi_bare_v1_";
+
+pub(super) fn encode_kimi_bare_call_id(call_id: &str) -> String {
+    format!(
+        "{KIMI_BARE_CALL_ID_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(call_id)
+    )
+}
+
+fn is_kimi_bare_call_id(call_id: &str) -> bool {
+    call_id
+        .strip_prefix(KIMI_BARE_CALL_ID_PREFIX)
+        .filter(|payload| !payload.is_empty())
+        .and_then(|payload| URL_SAFE_NO_PAD.decode(payload).ok())
+        .is_some_and(|bytes| std::str::from_utf8(&bytes).is_ok())
 }
 
 fn search_call_id(id: Option<&str>) -> anyhow::Result<&str> {
@@ -126,6 +146,19 @@ pub(crate) fn effective_response_tools(
                 _ => {}
             }
         }
+    }
+    static ADVISORY_GRAMMAR_WARNING: std::sync::Once = std::sync::Once::new();
+    if !ADVISORY_GRAMMAR_WARNING.is_completed() && tools.iter().any(|tool| match &tool.inner {
+        Tool::Custom(custom) => matches!(custom.format, CustomToolParamFormat::Grammar(_)),
+        Tool::Namespace(namespace) => namespace.tools.iter().any(|member| matches!(
+            member,
+            NamespaceToolParamTool::Custom(custom) if matches!(custom.format, CustomToolParamFormat::Grammar(_))
+        )),
+        _ => false,
+    }) {
+        ADVISORY_GRAMMAR_WARNING.call_once(|| {
+            tracing::warn!("Responses custom-tool grammars are advisory; decoding does not enforce regex or Lark constraints");
+        });
     }
     Ok(tools)
 }
@@ -300,7 +333,7 @@ impl NvCreateChatCompletionRequest {
         if let Some(context) = &mut self.responses_tools {
             context.kimi_replay = true;
             for (call_id, spellings) in &mut context.history_tool_names {
-                if call_id.ends_with("_bare") {
+                if is_kimi_bare_call_id(call_id) {
                     continue;
                 }
                 for spelling in spellings {
@@ -396,7 +429,7 @@ impl NvCreateChatCompletionRequest {
                         .get(&call.id)
                         .and_then(|names| names.get(*occurrence))
                         .unwrap_or(&call.function.name);
-                    call.function.name = if context.kimi_replay && call.id.ends_with("_bare") {
+                    call.function.name = if context.kimi_replay && is_kimi_bare_call_id(&call.id) {
                         context.names.decode(original).1.to_string()
                     } else {
                         resolve(original)
@@ -617,12 +650,8 @@ impl ResponseParams {
             )?);
         }
         let (name, namespace, custom) = self.tool_identity(emitted);
-        let call_id = if self.preserve_tool_spelling
-            && namespace.is_some()
-            && emitted == name
-            && !call_id.ends_with("_bare")
-        {
-            format!("{call_id}_bare")
+        let call_id = if self.preserve_tool_spelling && namespace.is_some() && emitted == name {
+            encode_kimi_bare_call_id(&call_id)
         } else {
             call_id
         };

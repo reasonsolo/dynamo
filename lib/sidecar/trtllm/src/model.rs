@@ -43,10 +43,14 @@ impl ConfiguredModel {
             );
         }
 
-        runtime_data.insert(
-            dynamo_llm::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY.to_string(),
-            serde_json::Value::Bool(true),
-        );
+        for capability in [
+            dynamo_llm::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY,
+            dynamo_llm::local_model::runtime_config::STRICT_GLM_THINKING_OFF_CAPABILITY,
+            dynamo_llm::local_model::runtime_config::INCOMPLETE_GLM_TOOL_CALL_ERRORS_CAPABILITY,
+            dynamo_llm::local_model::runtime_config::RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY,
+        ] {
+            runtime_data.insert(capability.to_string(), serde_json::Value::Bool(true));
+        }
 
         EngineConfig {
             model: self.source.clone(),

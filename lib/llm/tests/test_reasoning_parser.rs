@@ -560,6 +560,7 @@ mod tests {
             None, // No tool_definitions in this test
             false,
             false,
+            false, // No strict GLM capability for this backend.
             reasoning_parsed_stream,
         );
 
@@ -676,6 +677,7 @@ mod tests {
             None,
             false,
             false,
+            false, // No strict GLM capability for this backend.
             reasoning_parsed_stream,
         );
 
@@ -777,6 +779,7 @@ mod tests {
             None, // No tool_definitions in this test
             false,
             false,
+            false, // No strict GLM capability for this backend.
             reasoning_parsed_stream,
         );
 

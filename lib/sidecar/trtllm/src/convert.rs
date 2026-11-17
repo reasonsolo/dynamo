@@ -866,9 +866,10 @@ fn validate_request(
     }
     let sampling = &request.sampling_options;
     if sampling.include_stop_str_in_output == Some(true) {
-        // Would map to `include_stop_in_output`; not yet tested end to end.
+        // Parser boundaries have a separate frontend projection; ordinary user
+        // stop strings are still trimmed by the decoder on this path.
         return Err(client::invalid_argument(
-            "include_stop_str_in_output is not supported by the TensorRT-LLM sidecar",
+            "include_stop_str_in_output is not supported for user stop strings by the TensorRT-LLM sidecar",
         ));
     }
     if sampling.n.unwrap_or(1) != 1 {

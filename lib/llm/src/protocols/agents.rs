@@ -48,13 +48,6 @@ const AGENT_HEADER_MAPPINGS: &[AgentHeaderMapping] = &[
     },
 ];
 
-const LEGACY_SESSION_HEADERS: &[&str] = &[
-    "x-claude-session-id",
-    "x-correlation-id",
-    "x-session-affinity",
-    "x-multi-turn-session-id",
-];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentContextHeaderValues {
     pub(crate) session_id: String,
@@ -110,14 +103,7 @@ pub(crate) fn agent_context_header_values(headers: &HeaderMap) -> Option<AgentCo
             agent_headers: capture_agent_headers(headers),
         });
     }
-    LEGACY_SESSION_HEADERS.iter().find_map(|header| {
-        borrowed_header_value(headers, header).map(|session_id| AgentContextHeaderValues {
-            session_id: session_id.to_owned(),
-            parent_session_id: None,
-            session_final,
-            agent_headers: capture_agent_headers(headers),
-        })
-    })
+    None
 }
 
 const MAX_AGENT_HEADER_VALUES: usize = 64;
@@ -185,9 +171,7 @@ pub(crate) fn session_affinity_header_value(headers: &HeaderMap) -> Option<Strin
             .unwrap_or(root_session_id);
         return Some(session_id.to_owned());
     }
-    LEGACY_SESSION_HEADERS
-        .iter()
-        .find_map(|header| borrowed_header_value(headers, header).map(str::to_owned))
+    None
 }
 
 fn header_bool(headers: &HeaderMap, header_name: &str) -> Option<bool> {
@@ -198,18 +182,17 @@ fn header_bool(headers: &HeaderMap, header_name: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn legacy_session_aliases_do_not_override_agent_headers() {
-        for header in LEGACY_SESSION_HEADERS {
+    fn unverified_session_aliases_do_not_create_affinity() {
+        for header in [
+            "x-claude-session-id",
+            "x-correlation-id",
+            "x-session-affinity",
+            "x-multi-turn-session-id",
+        ] {
             let mut headers = HeaderMap::new();
-            headers.insert(*header, " legacy ".parse().unwrap());
-            assert_eq!(
-                session_affinity_header_value(&headers).as_deref(),
-                Some("legacy")
-            );
-            assert_eq!(
-                agent_context_header_values(&headers).unwrap().session_id,
-                "legacy"
-            );
+            headers.insert(header, "per-request-id".parse().unwrap());
+            assert!(session_affinity_header_value(&headers).is_none());
+            assert!(agent_context_header_values(&headers).is_none());
             headers.insert("thread-id", "codex".parse().unwrap());
             assert_eq!(
                 session_affinity_header_value(&headers).as_deref(),

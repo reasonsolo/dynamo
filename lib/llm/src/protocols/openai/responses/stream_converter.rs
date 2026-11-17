@@ -49,6 +49,7 @@ pub struct ResponseStreamConverter {
     response_id: String,
     model: String,
     params: ResponseParams,
+    reasoning_plaintext_enabled: bool,
     tool_names: super::ToolNameMap,
     allowed_names: Option<HashSet<String>>,
     /// Preserved Responses API-specific request context for faithful response reconstruction.
@@ -114,16 +115,17 @@ impl ReasoningState {
     fn completed_item(
         &self,
         output_status: OutputStatus,
+        include_plaintext: bool,
         include_encrypted: bool,
     ) -> ReasoningItem {
         ReasoningItem {
             id: Some(self.item_id.clone()),
             summary: vec![],
-            content: Some(vec![ReasoningItemContent::ReasoningText(
-                ReasoningTextContent {
+            content: include_plaintext.then(|| {
+                vec![ReasoningItemContent::ReasoningText(ReasoningTextContent {
                     text: self.accumulated_text.clone(),
-                },
-            )]),
+                })]
+            }),
             encrypted_content: include_encrypted
                 .then(|| super::reasoning_replay::encode(&self.accumulated_text)),
             status: Some(self.output_status.unwrap_or(output_status)),
@@ -171,6 +173,7 @@ impl ResponseStreamConverter {
             model,
             tool_names,
             allowed_names,
+            reasoning_plaintext_enabled: params.reasoning_plaintext_enabled(),
             params,
             api_context: None,
             created_at,
@@ -357,43 +360,48 @@ impl ResponseStreamConverter {
                         item: OutputItem::Reasoning(ReasoningItem {
                             id: Some(item_id.clone()),
                             summary: vec![],
-                            content: Some(vec![]),
+                            content: self.reasoning_plaintext_enabled.then(Vec::new),
                             encrypted_content: None,
                             status: Some(OutputStatus::InProgress),
                         }),
                     });
                 events.push(self.make_sse_event(&item_added));
 
-                let part_added =
-                    ResponseStreamEvent::ResponseContentPartAdded(ResponseContentPartAddedEvent {
-                        sequence_number: self.next_seq(),
-                        item_id,
-                        output_index,
-                        content_index: 0,
-                        part: OutputContent::ReasoningText(ReasoningTextContent {
-                            text: String::new(),
-                        }),
-                    });
-                events.push(self.make_sse_event(&part_added));
+                if self.reasoning_plaintext_enabled {
+                    let part_added = ResponseStreamEvent::ResponseContentPartAdded(
+                        ResponseContentPartAddedEvent {
+                            sequence_number: self.next_seq(),
+                            item_id,
+                            output_index,
+                            content_index: 0,
+                            part: OutputContent::ReasoningText(ReasoningTextContent {
+                                text: String::new(),
+                            }),
+                        },
+                    );
+                    events.push(self.make_sse_event(&part_added));
+                }
 
                 state_index
             }
         };
 
-        let (item_id, output_index) = {
-            let state = &mut self.reasoning_items[state_index];
-            state.accumulated_text.push_str(reasoning);
-            (state.item_id.clone(), state.output_index)
-        };
-        let delta =
-            ResponseStreamEvent::ResponseReasoningTextDelta(ResponseReasoningTextDeltaEvent {
-                sequence_number: self.next_seq(),
-                item_id,
-                output_index,
-                content_index: 0,
-                delta: reasoning.to_string(),
-            });
-        events.push(self.make_sse_event(&delta));
+        self.reasoning_items[state_index]
+            .accumulated_text
+            .push_str(reasoning);
+        if self.reasoning_plaintext_enabled {
+            let state = &self.reasoning_items[state_index];
+            let (item_id, output_index) = (state.item_id.clone(), state.output_index);
+            let delta =
+                ResponseStreamEvent::ResponseReasoningTextDelta(ResponseReasoningTextDeltaEvent {
+                    sequence_number: self.next_seq(),
+                    item_id,
+                    output_index,
+                    content_index: 0,
+                    delta: reasoning.to_string(),
+                });
+            events.push(self.make_sse_event(&delta));
+        }
     }
 
     fn append_active_reasoning_done_events(
@@ -404,42 +412,45 @@ impl ResponseStreamConverter {
         let Some(state_index) = self.active_reasoning_index.take() else {
             return;
         };
-        let (item_id, output_index, text, item) = {
+        let (output_index, visible_reasoning, item) = {
             let state = &mut self.reasoning_items[state_index];
             if state.output_status.is_some() {
                 return;
             }
             state.output_status = Some(output_status);
             (
-                state.item_id.clone(),
                 state.output_index,
-                state.accumulated_text.clone(),
+                self.reasoning_plaintext_enabled
+                    .then(|| (state.item_id.clone(), state.accumulated_text.clone())),
                 state.completed_item(
                     output_status,
+                    self.reasoning_plaintext_enabled,
                     self.params.reasoning_encrypted_content_requested(),
                 ),
             )
         };
 
-        let text_done =
-            ResponseStreamEvent::ResponseReasoningTextDone(ResponseReasoningTextDoneEvent {
-                sequence_number: self.next_seq(),
-                item_id: item_id.clone(),
-                output_index,
-                content_index: 0,
-                text: text.clone(),
-            });
-        events.push(self.make_sse_event(&text_done));
+        if let Some((item_id, text)) = visible_reasoning {
+            let text_done =
+                ResponseStreamEvent::ResponseReasoningTextDone(ResponseReasoningTextDoneEvent {
+                    sequence_number: self.next_seq(),
+                    item_id: item_id.clone(),
+                    output_index,
+                    content_index: 0,
+                    text: text.clone(),
+                });
+            events.push(self.make_sse_event(&text_done));
 
-        let part_done =
-            ResponseStreamEvent::ResponseContentPartDone(ResponseContentPartDoneEvent {
-                sequence_number: self.next_seq(),
-                item_id: item_id.clone(),
-                output_index,
-                content_index: 0,
-                part: OutputContent::ReasoningText(ReasoningTextContent { text }),
-            });
-        events.push(self.make_sse_event(&part_done));
+            let part_done =
+                ResponseStreamEvent::ResponseContentPartDone(ResponseContentPartDoneEvent {
+                    sequence_number: self.next_seq(),
+                    item_id: item_id.clone(),
+                    output_index,
+                    content_index: 0,
+                    part: OutputContent::ReasoningText(ReasoningTextContent { text }),
+                });
+            events.push(self.make_sse_event(&part_done));
+        }
 
         let item_done = ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
             sequence_number: self.next_seq(),
@@ -1251,6 +1262,7 @@ impl ResponseStreamConverter {
                 reasoning.output_index,
                 OutputItem::Reasoning(reasoning.completed_item(
                     output_status,
+                    self.reasoning_plaintext_enabled,
                     self.params.reasoning_encrypted_content_requested(),
                 )),
             ));
@@ -1861,23 +1873,86 @@ mod tests {
 
     #[test]
     fn requested_encoded_reasoning_matches_done_and_terminal_snapshot() {
-        let params = ResponseParams {
-            include: Some(vec![super::super::IncludeEnum::ReasoningEncryptedContent]),
-            ..Default::default()
-        };
+        for failure in [false, true] {
+            let params = ResponseParams {
+                include: Some(vec![super::super::IncludeEnum::ReasoningEncryptedContent]),
+                ..Default::default()
+            };
+            let mut converter = ResponseStreamConverter::new("m".into(), params);
+            let mut events = converter.process_chunk(&reasoning_chunk(" exact\n"));
+            events.extend(converter.process_chunk(&reasoning_chunk("工具 ")));
+            events.extend(if failure {
+                converter.emit_error_events(ResponseError {
+                    misalignment: None,
+                    code: ResponseErrorCode::ServerError,
+                    message: "backend failed".into(),
+                })
+            } else {
+                converter.emit_end_events()
+            });
+            let expected = super::super::reasoning_replay::encode(" exact\n工具 ");
+            for (event_type, pointer) in [
+                ("response.output_item.done", "/item/encrypted_content"),
+                (
+                    if failure {
+                        "response.failed"
+                    } else {
+                        "response.completed"
+                    },
+                    "/response/output/0/encrypted_content",
+                ),
+            ] {
+                let event = events
+                    .iter()
+                    .find(|event| self::event_type(event) == event_type)
+                    .expect("reasoning completion event");
+                assert_eq!(
+                    event_json(event)
+                        .pointer(pointer)
+                        .and_then(serde_json::Value::as_str),
+                    Some(expected.as_str())
+                );
+            }
+            let output = converter.completed_output();
+            let OutputItem::Reasoning(item) = &output[0] else {
+                panic!("missing reasoning");
+            };
+            assert_eq!(
+                item.encrypted_content.as_deref(),
+                Some(super::super::reasoning_replay::encode(" exact\n工具 ").as_str())
+            );
+            assert!(item.content.is_none());
+            for event in &events {
+                let json = event_json(event);
+                let event_type = self::event_type(event);
+                assert!(!event_type.starts_with("response.reasoning_text."));
+                assert!(!event_type.starts_with("response.content_part."));
+                assert!(
+                    !json.to_string().contains(" exact"),
+                    "plaintext leaked: {json}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_reasoning_with_requested_summary_keeps_visible_reasoning() {
+        let mut params = reasoning_params();
+        params.include = Some(vec![super::super::IncludeEnum::ReasoningEncryptedContent]);
         let mut converter = ResponseStreamConverter::new("m".into(), params);
-        converter.process_chunk(&reasoning_chunk(" exact\n"));
-        converter.process_chunk(&reasoning_chunk("工具 "));
-        converter.emit_end_events();
+        let mut events = converter.process_chunk(&reasoning_chunk("visible summary"));
+        events.extend(converter.emit_end_events());
+        assert!(
+            events
+                .iter()
+                .any(|event| event_type(event) == "response.reasoning_text.delta")
+        );
         let output = converter.completed_output();
         let OutputItem::Reasoning(item) = &output[0] else {
-            panic!("missing reasoning");
+            panic!("missing reasoning")
         };
-        assert_eq!(
-            item.encrypted_content.as_deref(),
-            Some(super::super::reasoning_replay::encode(" exact\n工具 ").as_str())
-        );
-        assert_eq!(reasoning_text(item), " exact\n工具 ");
+        assert_eq!(reasoning_text(item), "visible summary");
+        assert!(item.encrypted_content.is_some());
     }
 
     fn reasoning_text(item: &ReasoningItem) -> &str {

@@ -4226,61 +4226,43 @@ async fn check_reject_media_openai(status: StatusCode) {
             .send()
             .await
             .unwrap();
-        if content_type == "image_url" && request["model"] == "text-only" {
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            let _ = response.text().await.unwrap();
-            let captured = engine.messages.lock().unwrap().take().unwrap().to_string();
-            assert!(captured.contains("[image omitted]"), "{path}: {captured}");
-            assert!(!captured.contains("image_url"), "{path}: {captured}");
-            assert!(engine.nvext.lock().unwrap().take().is_some());
-            compare_counter(
-                &metrics,
-                &metric_model,
-                &endpoint,
-                &RequestType::Stream,
-                &Status::Error,
-                &ErrorType::UnsupportedModality,
-                refusals_before,
-            );
-        } else {
-            assert_eq!(response.status(), status, "{path}");
-            let body: serde_json::Value = response.json().await.unwrap();
-            assert_eq!(body["code"], status.as_u16(), "{path}");
-            assert_eq!(
-                body["message"],
-                format!(
-                    "Model does not accept {} input; received unsupported content type '{content_type}'.",
-                    if content_type == "input_audio" {
-                        "audio"
-                    } else {
-                        content_type.trim_end_matches("_url")
-                    }
-                ),
-                "{path}: {content_type}"
-            );
-            compare_counter(
-                &metrics,
-                &metric_model,
-                &endpoint,
-                &RequestType::Stream,
-                &Status::Error,
-                &ErrorType::UnsupportedModality,
-                refusals_before + 1,
-            );
-            compare_counter(
-                &metrics,
-                &metric_model,
-                &endpoint,
-                &RequestType::Stream,
-                &Status::Error,
-                &ErrorType::Overload,
-                overloads_before,
-            );
-            assert!(
-                engine.nvext.lock().unwrap().is_none(),
-                "refused request must not reach the engine: {path}"
-            );
-        }
+        assert_eq!(response.status(), status, "{path}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["code"], status.as_u16(), "{path}");
+        assert_eq!(
+            body["message"],
+            format!(
+                "Model does not accept {} input; received unsupported content type '{content_type}'.",
+                if content_type == "input_audio" {
+                    "audio"
+                } else {
+                    content_type.trim_end_matches("_url")
+                }
+            ),
+            "{path}: {content_type}"
+        );
+        compare_counter(
+            &metrics,
+            &metric_model,
+            &endpoint,
+            &RequestType::Stream,
+            &Status::Error,
+            &ErrorType::UnsupportedModality,
+            refusals_before + 1,
+        );
+        compare_counter(
+            &metrics,
+            &metric_model,
+            &endpoint,
+            &RequestType::Stream,
+            &Status::Error,
+            &ErrorType::Overload,
+            overloads_before,
+        );
+        assert!(
+            engine.nvext.lock().unwrap().is_none(),
+            "refused request must not reach the engine: {path}"
+        );
 
         let response = client
             .post(format!("http://localhost:{port}{path}"))
@@ -4396,17 +4378,22 @@ async fn check_reject_media_anthropic(status: StatusCode) {
                 .unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
+                status,
                 "tool_result={in_tool_result}, source={source}"
             );
-            let _ = response.text().await.unwrap();
-            let captured = engine.messages.lock().unwrap().take().unwrap().to_string();
-            assert!(captured.contains("[image omitted]"), "{captured}");
-            assert!(!captured.contains("image_url"), "{captured}");
-            if in_tool_result {
-                assert!(captured.contains("caption") && captured.contains("call_1"));
-            }
-
+            let request_id = response.headers()["request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["request_id"], request_id);
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(
+                body["error"]["message"],
+                "Model does not accept image input; received unsupported content type 'image_url'."
+            );
+            assert!(engine.messages.lock().unwrap().is_none());
             compare_counter(
                 &state.metrics_clone(),
                 &metric_model,
@@ -4414,7 +4401,7 @@ async fn check_reject_media_anthropic(status: StatusCode) {
                 &RequestType::Unary,
                 &Status::Error,
                 &ErrorType::UnsupportedModality,
-                before,
+                before + 1,
             );
         }
     }
@@ -4491,7 +4478,7 @@ async fn test_reject_media_preserves_openai_422() {
 }
 
 #[tokio::test]
-async fn test_text_only_images_are_omitted_anthropic() {
+async fn test_reject_media_refuses_text_only_images_anthropic() {
     check_reject_media_anthropic(StatusCode::TOO_MANY_REQUESTS).await;
 }
 
