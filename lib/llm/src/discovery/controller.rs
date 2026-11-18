@@ -1310,8 +1310,8 @@ fn cancel_build(status: &GroupStatus) {
     }
 }
 
-/// The committed workers that may keep serving: those still present, provided they
-/// all still publish `contract`. `None` withdraws the commit.
+/// The committed workers that may keep serving under the pipeline's contracts.
+/// `None` withdraws the commit.
 fn surviving_commit(
     members: &[DesiredInstance],
     committed_members: &BTreeSet<String>,
@@ -1321,7 +1321,7 @@ fn surviving_commit(
     // Keep serving the committed workers that are still here rather than demanding
     // the whole membership, so dropping the last worker of a rolling upgrade does
     // not withdraw a healthy group.
-    let surviving = members
+    let mut surviving = members
         .iter()
         .filter(|member| committed_members.contains(&member.key))
         .collect::<Vec<_>>();
@@ -1339,14 +1339,15 @@ fn surviving_commit(
     {
         return None;
     }
-    if let Some(contract) = input_modalities
-        && !surviving.iter().all(|member| {
+    if let Some(contract) = input_modalities {
+        surviving.retain(|member| {
             member
                 .input_modalities
                 .as_deref()
                 .is_some_and(|modalities| input_modalities_digest(modalities) == contract)
-        })
-    {
+        });
+    }
+    if surviving.is_empty() {
         return None;
     }
     Some(
@@ -1891,36 +1892,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn republished_modality_during_pending_rebuild_withdraws_the_retained_pipeline() {
+    async fn republished_modality_keeps_safe_members_during_rebuilds() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let (host, mut starts) = FakeHost::new();
-            let mut controller = ModelDiscoveryController::new(host.clone());
-            for id in [1, 2] {
-                controller.apply_added(instance_with_modalities(
-                    id,
-                    "same",
-                    Some(serde_json::json!(["text"])),
-                ));
+            for (start_rebuild, fail_rebuild, modalities) in [
+                (false, false, None),
+                (true, false, Some(serde_json::json!(["image"]))),
+                (true, true, Some(serde_json::json!(["text", 1]))),
+            ] {
+                let (host, mut starts) = FakeHost::new();
+                let mut controller = ModelDiscoveryController::new(host.clone());
+                for id in [1, 2] {
+                    controller.apply_added(instance_with_modalities(
+                        id,
+                        "same",
+                        Some(serde_json::json!(["text"])),
+                    ));
+                }
+                controller.start_queued_builds();
+                starts.recv().await.unwrap();
+                host.release.add_permits(1);
+                finish_build(&mut controller).await;
+                let admissions = host.admissions.lock().unwrap()[0].clone();
+                if start_rebuild {
+                    host.failures
+                        .store(usize::from(fail_rebuild), Ordering::SeqCst);
+                    controller.apply_added(instance_with_modalities(3, "same", None));
+                    controller.start_queued_builds();
+                    assert!(starts.recv().await.unwrap().input_modalities.is_none());
+                    if fail_rebuild {
+                        host.release.add_permits(1);
+                        finish_build(&mut controller).await;
+                    }
+                }
+                controller.apply_added(instance_with_modalities(1, "same", modalities));
+                assert_eq!(host.members(&group_key()).len(), 2);
+                assert_eq!(*admissions.borrow(), vec![2]);
+                assert_eq!(host.removed_groups.load(Ordering::SeqCst), 0);
+                let observation = host.inventory.snapshot().pop().unwrap().1;
+                assert_eq!(observation.committed, HashSet::from([2]));
+                if !start_rebuild || fail_rebuild {
+                    controller.start_queued_builds();
+                    assert!(starts.recv().await.unwrap().input_modalities.is_none());
+                }
+                host.release.add_permits(1);
+                finish_build(&mut controller).await;
+                assert_eq!(
+                    host.members(&group_key()).len(),
+                    if start_rebuild { 3 } else { 2 }
+                );
+                assert!(admissions.has_changed().is_err());
+                let observation = host.inventory.snapshot().pop().unwrap().1;
+                assert!(observation.committed.contains(&1));
+                assert!(observation.committed.contains(&2));
             }
-            controller.start_queued_builds();
-            starts.recv().await.unwrap();
-            host.release.add_permits(1);
-            finish_build(&mut controller).await;
-            let admissions = host.admissions.lock().unwrap()[0].clone();
-            controller.apply_added(instance_with_modalities(3, "same", None));
-            controller.start_queued_builds();
-            let pending = starts.recv().await.unwrap();
-            assert!(pending.input_modalities.is_none());
-            controller.apply_added(instance_with_modalities(
-                1,
-                "same",
-                Some(serde_json::json!(["image"])),
-            ));
-            assert!(host.members(&group_key()).is_empty());
-            assert!(admissions.borrow().is_empty());
-            host.release.add_permits(1);
-            finish_build(&mut controller).await;
-            assert_eq!(host.members(&group_key()).len(), 3);
         })
         .await
         .expect("modality cohort lifecycle timed out");

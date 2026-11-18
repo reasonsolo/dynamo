@@ -11,14 +11,18 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
 /// Decode JSON without discarding repeated keys at any object depth.
-pub(crate) struct UniqueJsonValue(pub(crate) Value);
+pub(crate) struct UniqueJsonValue<const REPORT_DUPLICATE_KEY: bool = false>(pub(crate) Value);
 
-impl<'de> Deserialize<'de> for UniqueJsonValue {
+impl<'de, const REPORT_DUPLICATE_KEY: bool> Deserialize<'de>
+    for UniqueJsonValue<REPORT_DUPLICATE_KEY>
+{
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct UniqueValueVisitor;
+        struct UniqueValueVisitor<const REPORT_DUPLICATE_KEY: bool>;
 
-        impl<'de> Visitor<'de> for UniqueValueVisitor {
-            type Value = UniqueJsonValue;
+        impl<'de, const REPORT_DUPLICATE_KEY: bool> Visitor<'de>
+            for UniqueValueVisitor<REPORT_DUPLICATE_KEY>
+        {
+            type Value = UniqueJsonValue<REPORT_DUPLICATE_KEY>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str("a JSON value without duplicate object fields")
@@ -63,7 +67,7 @@ impl<'de> Deserialize<'de> for UniqueJsonValue {
                 mut sequence: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut values = Vec::new();
-                while let Some(UniqueJsonValue(value)) = sequence.next_element()? {
+                while let Some(UniqueJsonValue(value)) = sequence.next_element::<Self::Value>()? {
                     values.push(value);
                 }
                 Ok(UniqueJsonValue(Value::Array(values)))
@@ -71,16 +75,35 @@ impl<'de> Deserialize<'de> for UniqueJsonValue {
 
             fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
                 let mut values = serde_json::Map::new();
-                while let Some((key, UniqueJsonValue(value))) = map.next_entry()? {
-                    if values.insert(key, value).is_some() {
-                        return Err(serde::de::Error::custom("duplicate metadata_upload field"));
+                while let Some(key) = map.next_key::<String>()? {
+                    // Metadata destinations can use private header names as object keys.
+                    let value = if REPORT_DUPLICATE_KEY && key == "metadata_upload" {
+                        map.next_value::<UniqueJsonValue<false>>()?.0
+                    } else {
+                        map.next_value::<Self::Value>()?.0
+                    };
+                    match values.entry(key) {
+                        serde_json::map::Entry::Vacant(entry) => {
+                            entry.insert(value);
+                        }
+                        serde_json::map::Entry::Occupied(entry) => {
+                            if REPORT_DUPLICATE_KEY {
+                                let key: String = entry.key().chars().take(64).collect();
+                                return Err(serde::de::Error::custom(format!(
+                                    "duplicate JSON object field {key:?}"
+                                )));
+                            }
+                            return Err(serde::de::Error::custom(
+                                "duplicate metadata_upload field",
+                            ));
+                        }
                     }
                 }
                 Ok(UniqueJsonValue(Value::Object(values)))
             }
         }
 
-        deserializer.deserialize_any(UniqueValueVisitor)
+        deserializer.deserialize_any(UniqueValueVisitor::<REPORT_DUPLICATE_KEY>)
     }
 }
 
@@ -108,7 +131,7 @@ impl Serialize for MetadataUpload {
 
 impl<'de> Deserialize<'de> for MetadataUpload {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let UniqueJsonValue(value) = UniqueJsonValue::deserialize(deserializer)?;
+        let UniqueJsonValue(value) = UniqueJsonValue::<false>::deserialize(deserializer)?;
         let object = value
             .as_object()
             .ok_or_else(|| serde::de::Error::custom("metadata_upload must be an object"))?;

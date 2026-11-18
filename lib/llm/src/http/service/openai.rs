@@ -544,8 +544,13 @@ fn is_context_length_error(response: &ErrorResponse) -> bool {
     }
     // OpenEngine v1 has no structured context-overflow field. Recognize the
     // engine's bounded-input diagnostics without classifying arbitrary 400s.
-    let message = response.1.message.to_ascii_lowercase();
+    is_context_overflow_diagnostic(&response.1.message)
+}
+
+fn is_context_overflow_diagnostic(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
     message.contains("maximum context length is ")
+        || message.contains("exceeds maximum input length")
         || (message.contains("input length")
             && message.contains("max_seq_len")
             && message.contains("exceed"))
@@ -2948,7 +2953,7 @@ where
 fn drop_duplicate_reasoning(body: &[u8]) -> Option<Vec<u8>> {
     // A plain `Value` keeps the last copy of a repeated key, so it would accept a second
     // `model` or `messages` that the typed parse rejects.
-    let UniqueJsonValue(mut value) = serde_json::from_slice(body).ok()?;
+    let UniqueJsonValue(mut value) = serde_json::from_slice::<UniqueJsonValue>(body).ok()?;
     let messages = value.get_mut("messages")?.as_array_mut()?;
     for message in messages.iter_mut() {
         if let Some(object) = message.as_object_mut()
@@ -3141,6 +3146,7 @@ pub(super) fn set_stream_semantic_error<T>(
 /// A backend error extracted from an event, ready for `backend_error_response`.
 pub(super) struct BackendErrorInfo {
     message: String,
+    context_overflow: bool,
     status: StatusCode,
     semantic: Option<dynamo_runtime::error::DynamoError>,
     /// Classification already established from the error chain, when the
@@ -3156,6 +3162,8 @@ impl BackendErrorInfo {
     /// The common case: nothing known beyond what the worker reported.
     fn from_status(message: String, status: StatusCode) -> Self {
         Self {
+            context_overflow: status == StatusCode::BAD_REQUEST
+                && is_context_overflow_diagnostic(&message),
             message,
             status,
             semantic: None,
@@ -3272,6 +3280,8 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
             let keep_semantic =
                 overloaded || semantic.is_some_and(|error| error.public_message().is_some());
             return Some(BackendErrorInfo {
+                context_overflow: code == StatusCode::BAD_REQUEST
+                    && is_context_overflow_diagnostic(&message),
                 message,
                 status: code,
                 semantic: if keep_semantic {
@@ -3297,6 +3307,7 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
 
         if overloaded {
             return Some(BackendErrorInfo {
+                context_overflow: false,
                 message: error_str,
                 status: overload_status_code(),
                 semantic: semantic.cloned(),
@@ -3532,6 +3543,7 @@ fn non_streaming_aggregation_error_response(
 /// range.
 fn backend_error_response(backend_error: BackendErrorInfo, record_failure: bool) -> ErrorResponse {
     let BackendErrorInfo {
+        context_overflow,
         message,
         status,
         semantic,
@@ -3588,17 +3600,22 @@ fn backend_error_response(backend_error: BackendErrorInfo, record_failure: bool)
             if render_record_failure {
                 record_local_failure(backend_http_error_class(status));
             }
-            let message = status
-                .canonical_reason()
-                .unwrap_or("Client error")
-                .to_string();
+            let message = if context_overflow {
+                "Request exceeds the model context length".to_string()
+            } else {
+                status
+                    .canonical_reason()
+                    .unwrap_or("Client error")
+                    .to_string()
+            };
             (
                 status,
                 Json(ErrorMessage {
                     message,
                     error_type: map_error_code_to_error_type(status),
                     code: status.as_u16(),
-                    details: None,
+                    details: context_overflow
+                        .then(|| Box::new(serde_json::json!({"type": "context_length"}))),
                     metric_error_type: None,
                 }),
             )
@@ -4916,7 +4933,8 @@ async fn handler_responses(
     body: Body,
 ) -> Result<Response, ErrorResponse> {
     let body = read_json_request_body(&headers, body).await?;
-    let UniqueJsonValue(mut body_value) = parse_json_request("responses", &body)?;
+    let UniqueJsonValue(mut body_value) =
+        parse_json_request::<UniqueJsonValue<true>>("responses", &body)?;
     crate::protocols::openai::responses::request_compat::hoist_additional_tools(&mut body_value)
         .map_err(|error| responses_conversion_error_response(error.into()))?;
     let body_affinity =
@@ -6980,59 +6998,70 @@ pub fn audios_router(
 mod tests {
     #[tokio::test]
     async fn context_overflow_is_a_typed_failed_sse_response() {
-        let event: Annotated<NvCreateChatCompletionStreamResponse> = Annotated {
-            event: Some("error".to_string()),
-            comment: Some(vec![
-                r#"{"code":400,"message":"Input length (100) exceeds max_seq_len (64). private backend diagnostic"}"#.into(),
-            ]),
-            data: None,
-            id: None,
-            error: None,
-        };
-        let backend_error = extract_backend_error_if_present(&event).unwrap();
-        let error = backend_error_response(backend_error, false);
-        assert_eq!(error.1.message, "Request exceeds the model context length");
-        assert_eq!(error.1.details.as_ref().unwrap()["type"], "context_length");
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(is_context_length_error(&error));
-        assert_eq!(
-            responses_error_code(&error, false),
-            ResponseErrorCode::InvalidPrompt
-        );
-        assert_eq!(
-            responses_error_code(&error, true),
-            ResponseErrorCode::Other("context_length_exceeded".into())
-        );
-        let response =
-            responses_overflow_stream("m".into(), ResponseParams::default(), None, &error);
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let text = std::str::from_utf8(&body).unwrap();
-        let events: Vec<serde_json::Value> = text
-            .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event["type"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            [
-                "response.created",
-                "response.in_progress",
-                "response.failed"
-            ]
-        );
-        assert_eq!(
-            events[2]["response"]["error"]["code"],
-            "context_length_exceeded"
-        );
-        assert_eq!(events[0]["response"]["id"], events[2]["response"]["id"]);
-        for (index, event) in events.iter().enumerate() {
-            assert_eq!(event["sequence_number"], index);
+        for diagnostic in [
+            "Input length (100) exceeds max_seq_len (64).",
+            "This model's maximum context length is 64 tokens.",
+            "Prompt length (100) exceeds maximum input length (64).",
+        ] {
+            let event: Annotated<NvCreateChatCompletionStreamResponse> = Annotated {
+                event: Some("error".to_string()),
+                comment: Some(vec![
+                    serde_json::json!({
+                        "code": 400,
+                        "message": format!("{diagnostic} private backend diagnostic"),
+                    })
+                    .to_string(),
+                ]),
+                data: None,
+                id: None,
+                error: None,
+            };
+            let backend_error = extract_backend_error_if_present(&event).unwrap();
+            let error = backend_error_response(backend_error, false);
+            assert_eq!(error.1.message, "Request exceeds the model context length");
+            assert_eq!(error.1.details.as_ref().unwrap()["type"], "context_length");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(is_context_length_error(&error));
+            assert_eq!(
+                responses_error_code(&error, false),
+                ResponseErrorCode::InvalidPrompt
+            );
+            assert_eq!(
+                responses_error_code(&error, true),
+                ResponseErrorCode::Other("context_length_exceeded".into())
+            );
+            let response =
+                responses_overflow_stream("m".into(), ResponseParams::default(), None, &error);
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(!text.contains("private backend diagnostic"));
+            let events: Vec<serde_json::Value> = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event["type"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "response.created",
+                    "response.in_progress",
+                    "response.failed"
+                ]
+            );
+            assert_eq!(
+                events[2]["response"]["error"]["code"],
+                "context_length_exceeded"
+            );
+            assert_eq!(events[0]["response"]["id"], events[2]["response"]["id"]);
+            for (index, event) in events.iter().enumerate() {
+                assert_eq!(event["sequence_number"], index);
+            }
         }
     }
 

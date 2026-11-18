@@ -37,15 +37,23 @@ const ENV: [(&str, Option<&str>); 1] = [(DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS
 async fn duplicate_fields_fail_before_responses_dispatch() {
     temp_env::async_with_vars(ENV, async {
         let svc = HarnessService::start([]).await;
+        let mut cases = Vec::new();
         for (field, value) in [
             ("model", json!("other-model")),
             ("input", json!("other-input")),
             ("tools", json!([])),
             ("stream", json!(true)),
         ] {
-            let body = format!(
-                r#"{{"model":"{MODEL}","input":"ping","tools":[],"stream":false,"{field}":{value}}}"#
-            );
+            cases.push((
+                format!(r#"{{"model":"{MODEL}","input":"ping","tools":[],"stream":false,"{field}":{value}}}"#),
+                format!("duplicate JSON object field \"{field}\""),
+            ));
+        }
+        cases.push((
+            format!(r#"{{"model":"{MODEL}","input":"ping","nvext":{{"metadata_upload":{{"kind":"generation_artifact","contents":[],"mode":"object_store","destination":{{"kind":"presigned_http_put","url":"https://example.com/upload","required_headers":{{"X-Token":"private-a","X-Token":"private-b"}},"expires_at":"2030-01-01T00:00:00Z","max_bytes":100,"object_id":"object"}}}}}}}}"#),
+            "duplicate metadata_upload field".to_string(),
+        ));
+        for (body, expected) in cases {
             let response = svc
                 .client
                 .post(format!("{}/v1/responses", svc.base_url))
@@ -54,9 +62,12 @@ async fn duplicate_fields_fail_before_responses_dispatch() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST, "{field}");
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST, "{expected}");
             let body: Value = response.json().await.unwrap();
-            assert!(body["message"].as_str().unwrap().contains("duplicate"));
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains(&expected), "{message}");
+            assert!(!message.contains("X-Token") && !message.contains("private-"), "{message}");
+            assert!(!message.contains("other-model") && !message.contains("other-input"), "{message}");
         }
         assert!(svc.engine.take_requests().await.is_empty());
         svc.shutdown().await;
