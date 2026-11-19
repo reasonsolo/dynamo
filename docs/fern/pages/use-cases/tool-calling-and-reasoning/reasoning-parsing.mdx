@@ -392,10 +392,10 @@ Parsers marked **Force-reasoning: Yes** start reasoning without an opening tag. 
         preserving their content and position. Responses developer input is also
         converted to system messages.
 
-        On deployments advertising `strict_glm_thinking_off=true`, a new assistant
-        generation with thinking disabled must render a prompt ending in
-        `</think>`. The TensorRT-LLM sidecar advertises this capability. A template
-        that leaves reasoning open returns HTTP 400 before generation:
+        For this GLM profile on the TensorRT-LLM OpenEngine sidecar, a new assistant
+        generation with thinking disabled requires a rendered prompt ending in
+        `</think>`. A template that leaves reasoning open triggers HTTP 400 before
+        generation.
 
         ```text
         The selected GLM chat template does not render a closed reasoning prefill for thinking-off. Remove the reasoning-off setting or use a template that supports it.

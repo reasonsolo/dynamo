@@ -920,8 +920,8 @@ async fn parser_stop_strings_cross_the_rpc_and_do_not_expose_hidden_tokens() {
     let config = engine.start(0).await.expect("start");
     for capability in [
         dynamo_llm::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY,
-        dynamo_llm::local_model::runtime_config::STRICT_GLM_THINKING_OFF_CAPABILITY,
-        dynamo_llm::local_model::runtime_config::INCOMPLETE_GLM_TOOL_CALL_ERRORS_CAPABILITY,
+        dynamo_llm::local_model::runtime_config::REQUIRE_CLOSED_REASONING_PREFILL_CAPABILITY,
+        dynamo_llm::local_model::runtime_config::REJECT_INCOMPLETE_NATIVE_TOOL_CALLS_CAPABILITY,
         dynamo_llm::local_model::runtime_config::RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY,
     ] {
         assert_eq!(config.runtime_data[capability], serde_json::json!(true));

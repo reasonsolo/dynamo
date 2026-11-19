@@ -78,6 +78,19 @@ pub(crate) const GEMMA4_UNIFIED_FAMILY: &str = "gemma4";
 /// The empty thought channel Gemma 4 opens with thinking off.
 pub(crate) const GEMMA4_EMPTY_THOUGHT_CHANNEL: &str = "<|channel>thought\n<channel|>";
 pub(crate) const GLM47_UNIFIED_FAMILY: &str = "glm47";
+pub(crate) fn glm_reasoning_prefill_is_closed(prompt: &str) -> bool {
+    prompt.trim_end().ends_with("</think>")
+}
+
+pub(crate) fn validate_glm_thinking_off_prefill(prompt: &str) -> anyhow::Result<()> {
+    if glm_reasoning_prefill_is_closed(prompt) {
+        return Ok(());
+    }
+    Err(crate::protocols::common::invalid_argument_error(
+        "The selected GLM chat template does not render a closed reasoning prefill for thinking-off. Remove the reasoning-off setting or use a template that supports it.",
+    ))
+}
+
 pub(crate) fn incomplete_tool_call_error() -> DynamoError {
     DynamoError::builder()
         .class(ErrorClass::BackendProtocol)
@@ -94,15 +107,23 @@ fn parser_error_annotation(
     ))
 }
 
+pub(crate) fn rejects_incomplete_native_tool_call(
+    family: &str,
+    reason: FinishReason,
+    enabled: bool,
+) -> bool {
+    enabled
+        && family == GLM47_UNIFIED_FAMILY
+        && matches!(reason, FinishReason::Stop | FinishReason::ToolCalls)
+}
+
 fn incomplete_glm_terminal(
     family: &str,
     reason: Option<FinishReason>,
-    strict: bool,
+    enabled: bool,
     incomplete: impl FnOnce() -> bool,
 ) -> Option<DynamoError> {
-    (strict
-        && family == GLM47_UNIFIED_FAMILY
-        && matches!(reason, Some(FinishReason::Stop | FinishReason::ToolCalls))
+    (reason.is_some_and(|reason| rejects_incomplete_native_tool_call(family, reason, enabled))
         && incomplete())
     .then(incomplete_tool_call_error)
 }
@@ -283,7 +304,7 @@ pub(crate) struct UnifiedRequestPolicy {
     pub reasoning_disabled: bool,
     pub structured_response: bool,
     pub multiple_choices: bool,
-    pub incomplete_glm_tool_call_errors: bool,
+    pub reject_incomplete_native_tool_calls: bool,
 }
 
 impl UnifiedRequestPolicy {
@@ -3409,7 +3430,7 @@ fn finish_unterminated_choices(
     states: &mut HashMap<u32, ChoiceState>,
     records: &mut HashMap<u32, ChoiceRecord>,
     family: &str,
-    strict_glm: bool,
+    reject_incomplete_native_tool_calls: bool,
 ) -> Vec<FinishedStreamChunk> {
     let mut indices: Vec<u32> = states
         .keys()
@@ -3438,11 +3459,12 @@ fn finish_unterminated_choices(
                 // use the family policy so default-on parsers retain their EOF contract.
                 let mut flushed = state.choices_for(&base, deltas, true, None);
                 state.resolve_complete_parsed_tool_calls_at_eof();
-                if let Some(error) =
-                    incomplete_glm_terminal(family, Some(FinishReason::Stop), strict_glm, || {
-                        state.has_incomplete_native_tool_call()
-                    })
-                {
+                if let Some(error) = incomplete_glm_terminal(
+                    family,
+                    Some(FinishReason::Stop),
+                    reject_incomplete_native_tool_calls,
+                    || state.has_incomplete_native_tool_call(),
+                ) {
                     for choice in &mut flushed {
                         choice.finish_reason = None;
                     }
@@ -3483,11 +3505,12 @@ fn finish_unterminated_choices(
                     &mut record.pending_parsed_tool_calls,
                     family,
                 );
-                if let Some(error) =
-                    incomplete_glm_terminal(family, Some(FinishReason::Stop), strict_glm, || {
-                        record.has_incomplete_native_tool_call()
-                    })
-                {
+                if let Some(error) = incomplete_glm_terminal(
+                    family,
+                    Some(FinishReason::Stop),
+                    reject_incomplete_native_tool_calls,
+                    || record.has_incomplete_native_tool_call(),
+                ) {
                     chunks.push(FinishedStreamChunk::Error(error.into()));
                     break;
                 }
@@ -3772,7 +3795,7 @@ where
         guided_streaming,
         // This test-only convenience helper opts into the strict OpenEngine profile.
         UnifiedRequestPolicy {
-            incomplete_glm_tool_call_errors: true,
+            reject_incomplete_native_tool_calls: true,
             ..Default::default()
         },
     )
@@ -3865,7 +3888,7 @@ where
                     for choice in flush_undecided_guided_prefixes(&mut undecided_guided_prefix, policy, prefill) {
                         yield response_with_choice(template, choice, &states, &records);
                     }
-                    for output in finish_unterminated_choices(&mut states, &mut records, family, policy.incomplete_glm_tool_call_errors) {
+                    for output in finish_unterminated_choices(&mut states, &mut records, family, policy.reject_incomplete_native_tool_calls) {
                         match output {
                             FinishedStreamChunk::Error(error) => { yield parser_error_annotation(error); return; }
                             FinishedStreamChunk::Choice(choice) => {
@@ -4134,7 +4157,7 @@ where
                         }
                         record.remember_state(&state);
                     }
-                    if let Some(error) = incomplete_glm_terminal(family, original.finish_reason, policy.incomplete_glm_tool_call_errors, || record.has_incomplete_native_tool_call()) {
+                    if let Some(error) = incomplete_glm_terminal(family, original.finish_reason, policy.reject_incomplete_native_tool_calls, || record.has_incomplete_native_tool_call()) {
                         original.finish_reason = None;
                         emitted.push(original);
                         glm_terminal_error = Some(error);
@@ -4431,7 +4454,7 @@ where
                     &chat.tool_call_completion,
                     original.index,
                 );
-                if let Some(error) = incomplete_glm_terminal(family, terminal, policy.incomplete_glm_tool_call_errors, || state.has_incomplete_native_tool_call()) {
+                if let Some(error) = incomplete_glm_terminal(family, terminal, policy.reject_incomplete_native_tool_calls, || state.has_incomplete_native_tool_call()) {
                     for choice in &mut choices { choice.finish_reason = None; }
                     emitted.extend(choices);
                     glm_terminal_error = Some(error);
@@ -4541,7 +4564,7 @@ where
             for choice in flush_undecided_guided_prefixes(&mut undecided_guided_prefix, policy, prefill) {
                         yield response_with_choice(template, choice, &states, &records);
                     }
-                    for output in finish_unterminated_choices(&mut states, &mut records, family, policy.incomplete_glm_tool_call_errors) {
+                    for output in finish_unterminated_choices(&mut states, &mut records, family, policy.reject_incomplete_native_tool_calls) {
                 match output {
                             FinishedStreamChunk::Error(error) => { yield parser_error_annotation(error); return; }
                     FinishedStreamChunk::Choice(choice) => {
@@ -13416,7 +13439,7 @@ pub(crate) mod tests {
                     GLM47_UNIFIED_FAMILY,
                     true,
                     UnifiedRequestPolicy {
-                        incomplete_glm_tool_call_errors: strict,
+                        reject_incomplete_native_tool_calls: strict,
                         ..Default::default()
                     },
                 )

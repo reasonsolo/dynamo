@@ -449,30 +449,7 @@ impl WorkerSet {
 
     /// Build ParsingOptions from this WorkerSet's card configuration.
     pub fn parsing_options(&self) -> crate::protocols::openai::ParsingOptions {
-        crate::protocols::openai::ParsingOptions {
-            incomplete_glm_tool_call_errors: self.card.runtime_config.runtime_data
-                .get(crate::local_model::runtime_config::INCOMPLETE_GLM_TOOL_CALL_ERRORS_CAPABILITY)
-                .and_then(serde_json::Value::as_bool) == Some(true),
-            responses_context_overflow_events: self.card.runtime_config.runtime_data
-                .get(crate::local_model::runtime_config::RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY)
-                .and_then(serde_json::Value::as_bool) == Some(true),
-            default_thinking_mode: self
-                .card
-                .runtime_config
-                .runtime_data
-                .get(crate::preprocessor::DEFAULT_THINKING_MODE_RUNTIME_KEY)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            structural_tag: self.card.runtime_config.structural_tag.clone(),
-            exclude_tools_when_tool_choice_none: self
-                .card
-                .runtime_config
-                .exclude_tools_when_tool_choice_none,
-            ..crate::protocols::openai::ParsingOptions::new(
-                self.card.runtime_config.tool_call_parser.clone(),
-                self.card.runtime_config.reasoning_parser.clone(),
-            )
-        }
+        crate::protocols::openai::ParsingOptions::from_runtime_config(&self.card.runtime_config)
     }
 
     /// Current instance membership, excluding canceled and closed lifecycle views.

@@ -31,11 +31,12 @@ pub const TOPOLOGY_TAINT_PREFIX: &str = "dynamo.topology/";
 /// Engine retains parser stop strings while frontend trims ordinary user stops.
 pub const VISIBLE_STOP_STRINGS_CAPABILITY: &str = "visible_stop_strings";
 
-/// Require GLM thinking-off templates to close reasoning before generation.
-pub const STRICT_GLM_THINKING_OFF_CAPABILITY: &str = "strict_glm_thinking_off";
+/// Require a closed reasoning prefill when a supported parser disables thinking.
+pub const REQUIRE_CLOSED_REASONING_PREFILL_CAPABILITY: &str = "require_closed_reasoning_prefill";
 
-/// Report truncated native GLM tool calls as protocol errors rather than length.
-pub const INCOMPLETE_GLM_TOOL_CALL_ERRORS_CAPABILITY: &str = "incomplete_glm_tool_call_errors";
+/// Report incomplete native tool calls as protocol errors at a successful finish.
+pub const REJECT_INCOMPLETE_NATIVE_TOOL_CALLS_CAPABILITY: &str =
+    "reject_incomplete_native_tool_calls";
 
 /// Render Responses context overflow as an in-protocol failed event stream.
 pub const RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY: &str = "responses_context_overflow_events";
@@ -538,6 +539,13 @@ impl ModelRuntimeConfig {
             self.structural_tag_scope = StructuralTagScope::Auto;
             self.structural_tag_schema = StructuralTagSchemaMode::Auto;
         }
+    }
+
+    pub(crate) fn reject_incomplete_native_tool_calls(&self) -> bool {
+        self.runtime_data
+            .get(REJECT_INCOMPLETE_NATIVE_TOOL_CALLS_CAPABILITY)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
     }
 
     /// Check whether a runtime boolean is explicitly enabled.

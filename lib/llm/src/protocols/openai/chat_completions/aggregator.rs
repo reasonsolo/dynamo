@@ -784,14 +784,12 @@ impl DeltaAggregator {
                             aggregator.response_events = parsed.events;
                         }
                         if parsed.incomplete_native_call
-                            && parsing_options.incomplete_glm_tool_call_errors
-                            && family == super::unified_parser::GLM47_UNIFIED_FAMILY
-                            && matches!(
-                                choice.finish_reason,
-                                None | Some(
-                                    dynamo_protocols::types::FinishReason::Stop
-                                        | dynamo_protocols::types::FinishReason::ToolCalls
-                                )
+                            && super::unified_parser::rejects_incomplete_native_tool_call(
+                                family,
+                                choice
+                                    .finish_reason
+                                    .unwrap_or(dynamo_protocols::types::FinishReason::Stop),
+                                parsing_options.reject_incomplete_native_tool_calls,
                             )
                         {
                             return Err(super::unified_parser::incomplete_tool_call_error());
@@ -875,20 +873,17 @@ impl DeltaAggregator {
                     &parsing_options.tools,
                 )
                 .await;
-                if parser == "glm47"
-                    && parsing_options.incomplete_glm_tool_call_errors
-                    && matches!(
-                        choice.finish_reason,
-                        None | Some(
-                            dynamo_protocols::types::FinishReason::Stop
-                                | dynamo_protocols::types::FinishReason::ToolCalls
-                        )
-                    )
-                    && super::unified_parser::first_unquoted_native_tool_call_marker(
-                        &choice.text,
-                        "glm47",
-                    )
-                    .is_some()
+                if super::unified_parser::rejects_incomplete_native_tool_call(
+                    parser,
+                    choice
+                        .finish_reason
+                        .unwrap_or(dynamo_protocols::types::FinishReason::Stop),
+                    parsing_options.reject_incomplete_native_tool_calls,
+                ) && super::unified_parser::first_unquoted_native_tool_call_marker(
+                    &choice.text,
+                    "glm47",
+                )
+                .is_some()
                     && super::unified_parser::glm_unfinished_call(&choice.text)
                         .map_err(|error| {
                             dynamo_runtime::error::DynamoError::from(
@@ -4013,7 +4008,7 @@ mod tests {
                 let result = DeltaAggregator::apply(
                     Box::pin(stream::iter(vec![delta, other])),
                     ParsingOptions::new(Some("glm47".to_string()), None)
-                        .with_incomplete_glm_tool_call_errors(strict),
+                        .with_reject_incomplete_native_tool_calls(strict),
                 )
                 .await;
                 if strict && reason != Some(FinishReason::Length) {

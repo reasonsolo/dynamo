@@ -463,9 +463,9 @@ pub struct ParsingOptions {
     #[serde(default)]
     pub reasoning_disabled: bool,
 
-    /// The selected worker's opt-in to strict native GLM tool-call failures.
+    /// Whether the selected deployment rejects incomplete native tool calls.
     #[serde(default)]
-    pub incomplete_glm_tool_call_errors: bool,
+    pub reject_incomplete_native_tool_calls: bool,
 
     #[serde(default)]
     pub responses_context_overflow_events: bool,
@@ -541,7 +541,7 @@ impl ParsingOptions {
             tool_call_parser,
             reasoning_parser,
             reasoning_disabled: false,
-            incomplete_glm_tool_call_errors: false,
+            reject_incomplete_native_tool_calls: false,
             responses_context_overflow_events: false,
             structured_response: false,
             default_thinking_mode: None,
@@ -557,8 +557,36 @@ impl ParsingOptions {
         }
     }
 
-    pub fn with_incomplete_glm_tool_call_errors(mut self, enabled: bool) -> Self {
-        self.incomplete_glm_tool_call_errors = enabled;
+    pub(crate) fn from_runtime_config(
+        config: &crate::local_model::runtime_config::ModelRuntimeConfig,
+    ) -> Self {
+        use crate::local_model::runtime_config::RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY;
+        use crate::preprocessor::DEFAULT_THINKING_MODE_RUNTIME_KEY;
+
+        Self {
+            reject_incomplete_native_tool_calls: config.reject_incomplete_native_tool_calls(),
+            responses_context_overflow_events: config
+                .runtime_data
+                .get(RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
+            default_thinking_mode: config
+                .runtime_data
+                .get(DEFAULT_THINKING_MODE_RUNTIME_KEY)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            structural_tag: config.structural_tag.clone(),
+            exclude_tools_when_tool_choice_none: config.exclude_tools_when_tool_choice_none,
+            ..Self::new(
+                config.tool_call_parser.clone(),
+                config.reasoning_parser.clone(),
+            )
+        }
+    }
+
+    #[cfg(test)]
+    fn with_reject_incomplete_native_tool_calls(mut self, enabled: bool) -> Self {
+        self.reject_incomplete_native_tool_calls = enabled;
         self
     }
 

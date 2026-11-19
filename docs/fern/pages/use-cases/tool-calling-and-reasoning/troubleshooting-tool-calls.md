@@ -166,10 +166,10 @@ grammar formats; use its `text` format for freeform custom tools.
 
 ## Incomplete GLM Tool Calls
 
-On deployments advertising `incomplete_glm_tool_call_errors=true`, an incomplete
-native GLM tool call at a backend `stop` or `tool_calls` finish, or at unexpected
-stream end, is a `BackendProtocol` failure. The TensorRT-LLM sidecar advertises
-this capability. Both unified/V2 and legacy/V1 GLM parsing enforce it.
+On the TensorRT-LLM OpenEngine sidecar, an incomplete native GLM tool call at a
+backend `stop` or `tool_calls` finish or unexpected stream end triggers a
+`BackendProtocol` failure. Both unified/V2 and legacy/V1 GLM parsing enforce
+this behavior.
 
 Already-parsed text is emitted before a streaming failure; a non-streaming
 request fails instead of returning a partial result. A backend `length` finish
