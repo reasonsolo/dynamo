@@ -62,6 +62,7 @@ use crate::preprocessor::{
     PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY, REQUEST_PARSING_OPTIONS_CONTEXT_KEY,
     decode_base64_to_floats,
 };
+use crate::protocols::agents::agent_context_header_values_for_session;
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, AgentContext, InputTrigger, NvExt as CommonNvExt,
     SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId, UPSTREAM_ELAPSED_CONTEXT_KEY,
@@ -71,7 +72,7 @@ use crate::protocols::common::extensions::{
 use crate::protocols::common::input_trigger::{
     classify_chat_request, classify_completion_request, classify_response_request,
 };
-use crate::protocols::common::metadata_upload::UniqueJsonValue;
+use crate::protocols::common::unique_json::UniqueJsonValue;
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::chat_completions::tool_call_merge::{
     ToolCallMergeOutcome, merge_tool_call_chunk,
@@ -528,8 +529,62 @@ fn responses_conversion_error_response(error: anyhow::Error) -> ErrorResponse {
     }
 }
 
-fn responses_error_code(status_code: StatusCode) -> ResponseErrorCode {
-    match status_code {
+fn is_context_length_error(response: &ErrorResponse) -> bool {
+    if response.0 != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    if response
+        .1
+        .details
+        .as_deref()
+        .and_then(|details| details.get("type"))
+        .and_then(serde_json::Value::as_str)
+        == Some("context_length")
+    {
+        return true;
+    }
+    // OpenEngine v1 has no structured context-overflow field. Recognize the
+    // engine's bounded-input diagnostics without classifying arbitrary 400s.
+    is_context_overflow_diagnostic(&response.1.message)
+}
+
+fn is_context_overflow_diagnostic(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("maximum context length is ")
+        || message.contains("exceeds maximum input length")
+        || (message.contains("input length")
+            && message.contains("max_seq_len")
+            && message.contains("exceed"))
+}
+
+fn responses_overflow_stream(
+    model: String,
+    params: ResponseParams,
+    context: Option<crate::protocols::unified::ResponsesContext>,
+    error: &ErrorResponse,
+) -> Response {
+    use crate::protocols::openai::responses::stream_converter::ResponseStreamConverter;
+    let mut converter = match context {
+        Some(context) => ResponseStreamConverter::with_context(model, params, context),
+        None => ResponseStreamConverter::new(model, params),
+    };
+    let mut events = converter.emit_start_events();
+    events.extend(converter.emit_error_events(ResponseError {
+        misalignment: None,
+        code: responses_error_code(error, true),
+        message: error.1.message.clone(),
+    }));
+    Sse::new(stream::iter(events)).into_response()
+}
+
+fn responses_error_code(
+    response: &ErrorResponse,
+    context_overflow_events: bool,
+) -> ResponseErrorCode {
+    if context_overflow_events && is_context_length_error(response) {
+        return ResponseErrorCode::Other("context_length_exceeded".into());
+    }
+    match response.0 {
         StatusCode::TOO_MANY_REQUESTS => ResponseErrorCode::RateLimitExceeded,
         code if code.is_client_error() => ResponseErrorCode::InvalidPrompt,
         _ => ResponseErrorCode::ServerError,
@@ -3092,6 +3147,7 @@ pub(super) fn set_stream_semantic_error<T>(
 /// A backend error extracted from an event, ready for `backend_error_response`.
 pub(super) struct BackendErrorInfo {
     message: String,
+    context_overflow: bool,
     status: StatusCode,
     semantic: Option<dynamo_runtime::error::DynamoError>,
     /// Classification already established from the error chain, when the
@@ -3107,6 +3163,8 @@ impl BackendErrorInfo {
     /// The common case: nothing known beyond what the worker reported.
     fn from_status(message: String, status: StatusCode) -> Self {
         Self {
+            context_overflow: status == StatusCode::BAD_REQUEST
+                && is_context_overflow_diagnostic(&message),
             message,
             status,
             semantic: None,
@@ -3116,6 +3174,11 @@ impl BackendErrorInfo {
     }
 
     fn with_semantic(mut self, error: Option<&dynamo_runtime::error::DynamoError>) -> Self {
+        if self.status == StatusCode::BAD_REQUEST
+            && let Some(error) = error.filter(|error| is_invalid_argument(error))
+        {
+            self.context_overflow |= is_context_overflow_diagnostic(error.message());
+        }
         self.semantic = error.cloned();
         self
     }
@@ -3223,6 +3286,8 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
             let keep_semantic =
                 overloaded || semantic.is_some_and(|error| error.public_message().is_some());
             return Some(BackendErrorInfo {
+                context_overflow: code == StatusCode::BAD_REQUEST
+                    && is_context_overflow_diagnostic(&message),
                 message,
                 status: code,
                 semantic: if keep_semantic {
@@ -3248,6 +3313,7 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
 
         if overloaded {
             return Some(BackendErrorInfo {
+                context_overflow: false,
                 message: error_str,
                 status: overload_status_code(),
                 semantic: semantic.cloned(),
@@ -3483,6 +3549,7 @@ fn non_streaming_aggregation_error_response(
 /// range.
 fn backend_error_response(backend_error: BackendErrorInfo, record_failure: bool) -> ErrorResponse {
     let BackendErrorInfo {
+        context_overflow,
         message,
         status,
         semantic,
@@ -3512,9 +3579,13 @@ fn backend_error_response(backend_error: BackendErrorInfo, record_failure: bool)
                 "backend.unknown" | "runtime.unclassified"
             );
         if is_classified
-            && let Some(response) =
+            && let Some(mut response) =
                 ErrorMessage::from_semantic_error_with_recording(error, record_failure)
         {
+            if context_overflow && response.0 == StatusCode::BAD_REQUEST {
+                response.1.message = "Request exceeds the model context length".to_string();
+                response.1.details = Some(Box::new(serde_json::json!({"type": "context_length"})));
+            }
             return response;
         }
         if matches!(http_action_for_error(error), ClientErrorAction::NoDelivery) {
@@ -3539,17 +3610,22 @@ fn backend_error_response(backend_error: BackendErrorInfo, record_failure: bool)
             if render_record_failure {
                 record_local_failure(backend_http_error_class(status));
             }
-            let message = status
-                .canonical_reason()
-                .unwrap_or("Client error")
-                .to_string();
+            let message = if context_overflow {
+                "Request exceeds the model context length".to_string()
+            } else {
+                status
+                    .canonical_reason()
+                    .unwrap_or("Client error")
+                    .to_string()
+            };
             (
                 status,
                 Json(ErrorMessage {
                     message,
                     error_type: map_error_code_to_error_type(status),
                     code: status.as_u16(),
-                    details: None,
+                    details: context_overflow
+                        .then(|| Box::new(serde_json::json!({"type": "context_length"}))),
                     metric_error_type: None,
                 }),
             )
@@ -4265,29 +4341,21 @@ async fn chat_completions(
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
-
-    tracing::trace!("Getting chat completions engine for model: {}", model);
-
     // Selected once: the Beam request normalization below reads this engine's parsing
     // options and dispatch uses this same engine, so the two cannot disagree on the
     // worker set when one served name fronts Beam and non-Beam pools.
     // The lookup sits inside validation, so this range nests in
     // frontend.http.chat.validate, whose duration includes it.
     let nvtx_lookup = dynamo_nvtx_range!("frontend.http.chat.engine_lookup");
-    // Text-input WorkerSets never run the preprocessor gate, so admit custom
-    // content only where a WorkerSet advertises it.
-    let (engine, parsing_options) = if crate::preprocessor::has_custom_content(request.content()) {
-        state
-            .manager()
-            .get_chat_completions_engine_with_parsing_for_capability(
-                &model,
-                crate::local_model::runtime_config::JSON_MULTIMODAL_CAPABILITY,
-            )
+    // Custom content requires explicit support on the same deployment used for omission.
+    let engine_selection = if crate::preprocessor::has_custom_content(request.content()) {
+        super::image_omission::select_chat_engine_for_capability(
+            &state,
+            &model,
+            crate::local_model::runtime_config::JSON_MULTIMODAL_CAPABILITY,
+        )
     } else {
-        state
-            .manager()
-            .get_chat_completions_engine_with_parsing(&model)
-            .map(Some)
+        super::image_omission::select_chat_engine(&state, &model).map(Some)
     }
     .map_err(|e| ErrorMessage::from_model_error(&e))
     .and_then(|selected| {
@@ -4302,6 +4370,13 @@ async fn chat_completions(
         inflight_guard.mark_error(extract_error_type_from_response(err_response));
     })?;
     drop(nvtx_lookup);
+    if engine_selection.2 {
+        super::image_omission::omit_chat_images(&mut request.inner.messages);
+    }
+
+    tracing::trace!("Getting chat completions engine for model: {}", model);
+
+    let (engine, parsing_options, _) = engine_selection;
 
     // Beam route, before generic validation (which rejects what this normalizes): a
     // legacy `builtin_tools` declaration is promoted into `tools` (see
@@ -4834,6 +4909,30 @@ async fn handler_responses_input_tokens(
     Ok(Json(CountInputTokensResponse::new(request.estimate_tokens())).into_response())
 }
 
+fn apply_responses_body_affinity(
+    request: &mut Context<NvCreateResponse>,
+    headers: &HeaderMap,
+    affinity: Option<String>,
+    explicit: bool,
+) {
+    if !explicit && session_affinity_from_headers(headers).is_some() {
+        return;
+    }
+    let Some(affinity) = affinity else {
+        return;
+    };
+    let mut agent = AgentContext::from(agent_context_header_values_for_session(
+        headers,
+        affinity.clone(),
+    ));
+    agent.input_trigger = Some(classify_response_request(request.content()));
+    request.insert(
+        SESSION_AFFINITY_CONTEXT_KEY,
+        SessionAffinityId::new(affinity),
+    );
+    request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent);
+}
+
 /// OpenAI Responses Request Handler
 ///
 /// This method will handle the incoming request for the /v1/responses endpoint.
@@ -4843,7 +4942,31 @@ async fn handler_responses(
     body: Body,
 ) -> Result<Response, ErrorResponse> {
     let body = read_json_request_body(&headers, body).await?;
-    let mut request: NvCreateResponse = parse_json_request("responses", &body)?;
+    let UniqueJsonValue(mut body_value) = parse_json_request("responses", &body)?;
+    // Custom tool results share function-result conversion and media policy.
+    if let Some(items) = body_value
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in items {
+            if item.get("type").and_then(serde_json::Value::as_str)
+                == Some("custom_tool_call_output")
+            {
+                item["type"] = serde_json::json!("function_call_output");
+            }
+        }
+    }
+    crate::protocols::openai::responses::request_compat::hoist_additional_tools(&mut body_value)
+        .map_err(|error| responses_conversion_error_response(error.into()))?;
+    let body_affinity =
+        crate::protocols::openai::responses::request_compat::body_affinity(&body_value)
+            .map(str::to_owned);
+    let explicit_body_affinity = body_value
+        .pointer("/conversation_params/conversation_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty());
+    let mut request: NvCreateResponse =
+        serde_json::from_value(body_value).map_err(json_deserialize_error)?;
 
     // return a 503 if the service or model is not ready.
     // Resolve the templated model first so empty/missing `model` fields
@@ -4889,6 +5012,12 @@ async fn handler_responses(
         context_from_headers_with_input_trigger(request, request_id, &headers, |request| {
             Some(classify_response_request(request))
         })?;
+    apply_responses_body_affinity(
+        &mut request,
+        &headers,
+        body_affinity,
+        explicit_body_affinity,
+    );
     attach_upstream_elapsed(&mut request, &headers, state.nvext_enabled());
     if let Some(captured) = crate::request_trace::payload::capture_http_headers(&headers) {
         request.insert(
@@ -4994,6 +5123,10 @@ async fn responses(
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
+    let engine_selection = super::image_omission::select_chat_engine(&state, &model);
+    if engine_selection.as_ref().is_ok_and(|(_, _, omit)| *omit) {
+        super::image_omission::omit_response_images(&mut request.inner.input);
+    }
 
     // Extract request parameters before into_parts() consumes the request.
     // These are echoed back in the Response object per the OpenAI spec.
@@ -5007,7 +5140,9 @@ async fn responses(
             .into_iter()
             .map(|tool| tool.inner)
             .collect();
-    let response_params = ResponseParams {
+    let mut response_params = ResponseParams {
+        preserve_tool_spelling: false,
+        emit_backend_reasoning: false,
         tool_names: Some(crate::protocols::openai::responses::ToolNameMap::new(
             &loaded_tools,
             Some(&request.inner.input),
@@ -5090,12 +5225,39 @@ async fn responses(
             continuous_usage_stats: false,
         });
 
+    tracing::trace!("Getting chat completions engine for model: {}", model);
+
+    let (engine, parsing_options, _) = engine_selection.map_err(|e| {
+        let err_response = ErrorMessage::from_model_error(&e);
+        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        err_response
+    })?;
+
+    if matches!(
+        parsing_options.tool_call_parser.as_deref(),
+        Some("kimi_k3" | "kimi-k3")
+    ) {
+        chat_request.normalize_kimi_replay().map_err(|error| {
+            let response = responses_conversion_error_response(error);
+            inflight_guard.mark_error(extract_error_type_from_response(&response));
+            response
+        })?;
+    }
+
+    // Match the Kimi/GLM Responses contract without exposing other models' private channels.
+    response_params.emit_backend_reasoning = matches!(
+        parsing_options.tool_call_parser.as_deref(),
+        Some("kimi_k3" | "kimi-k3" | "glm47")
+    ) || matches!(
+        parsing_options.reasoning_parser.as_deref(),
+        Some("kimi_k3" | "kimi-k3" | "glm45")
+    );
+
     let mut request = context.map(|mut _req| chat_request);
     if response_params.max_output_tokens.is_none() {
         request.insert(PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY, true);
     }
-    // Clients get public tool names and namespaces, not backend aliases;
-    // request traces record them. Skip the map clone when traces are off.
+
     if crate::request_trace::policy().emit_request_end_records()
         && let Some(tool_names) = response_params.tool_names.clone()
     {
@@ -5105,19 +5267,12 @@ async fn responses(
         );
     }
 
-    tracing::trace!("Getting chat completions engine for model: {}", model);
-
-    let (engine, parsing_options) = state
-        .manager()
-        .get_chat_completions_engine_with_parsing(&model)
-        .map_err(|e| {
-            let err_response = ErrorMessage::from_model_error(&e);
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
-            err_response
-        })?;
-
     // The Responses API is converted to the same chat request contract. Narrow
     // the model parser before unary aggregation just as the streaming path does.
+    response_params.preserve_tool_spelling = matches!(
+        parsing_options.tool_call_parser.as_deref(),
+        Some("kimi_k3" | "kimi-k3")
+    );
     let parsing_options = apply_request_tool_call_parsing_options(parsing_options, &request)
         .map_err(|e| {
             let err_response = ErrorMessage::from_anyhow(e.into(), "Invalid tool_choice");
@@ -5161,6 +5316,8 @@ async fn responses(
     let mut response_collector = inflight_guard.response_collector();
     inflight_guard.request_metrics().attach_to(&mut request);
 
+    let context_overflow_events = parsing_options.responses_context_overflow_events;
+
     tracing::trace!("Issuing generate call for responses");
 
     // issue the generate call on the engine
@@ -5173,7 +5330,19 @@ async fn responses(
         let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         err_response
-    })?;
+    });
+    let engine_stream = match engine_stream {
+        Ok(stream) => stream,
+        Err(error) if streaming && context_overflow_events && is_context_length_error(&error) => {
+            return Ok(responses_overflow_stream(
+                model,
+                response_params,
+                responses_ctx,
+                &error,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
 
     // Capture the context to cancel the stream if the client disconnects
     let ctx = engine_stream.context();
@@ -5191,7 +5360,19 @@ async fn responses(
         .inspect_err(|err_response| {
             log_pre_commit_error(&request_id, err_response);
             inflight_guard.mark_error(extract_error_type_from_response(err_response));
-        })?;
+        });
+        let engine_stream = match engine_stream {
+            Ok(stream) => stream,
+            Err(error) if context_overflow_events && is_context_length_error(&error) => {
+                return Ok(responses_overflow_stream(
+                    model,
+                    response_params,
+                    responses_ctx,
+                    &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
 
         // Streaming path: convert chat completion stream chunks to Responses API SSE events.
         // The engine yields Annotated<NvCreateChatCompletionStreamResponse>. We extract the
@@ -5241,7 +5422,7 @@ async fn responses(
                         }
                         backend_error = Some(ResponseError {
                             misalignment: None,
-                            code: responses_error_code(error_response.0),
+                            code: responses_error_code(&error_response, context_overflow_events),
                             message: error_response.1.message.clone(),
                         });
                     }
@@ -6835,6 +7016,70 @@ pub fn audios_router(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn body_affinity_obeys_explicit_body_then_header_then_fallback_precedence() {
+        for (header, explicit, expected, expected_parent) in [
+            (None, false, "body", Some("header")),
+            (Some("x-session-id"), false, "header", None),
+            (Some("x-session-id"), true, "body", None),
+            (Some("x-dynamo-session-id"), true, "body", Some("header")),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(name) = header {
+                headers.insert(name, "header".parse().unwrap());
+            }
+            headers.insert("x-dynamo-parent-session-id", "header".parse().unwrap());
+            let mut context =
+                context_from_headers(NvCreateResponse::default(), "r".into(), &headers).unwrap();
+            apply_responses_body_affinity(&mut context, &headers, Some("body".into()), explicit);
+            let affinity = context
+                .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                .unwrap();
+            assert_eq!(affinity.as_str(), expected);
+            let agent = context
+                .get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
+                .unwrap();
+            assert_eq!(agent.session_id, expected);
+            assert_eq!(agent.parent_session_id.as_deref(), expected_parent);
+        }
+    }
+
+    #[test]
+    fn cache_and_correlation_hints_do_not_establish_session_affinity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-correlation-id", "gateway-request-id".parse().unwrap());
+        headers.insert("x-dynamo-parent-session-id", "parent".parse().unwrap());
+        headers.insert("x-dynamo-session-final", "true".parse().unwrap());
+        for conversation in [None, Some("conversation")] {
+            let body = serde_json::json!({
+                "prompt_cache_key": "x".repeat(257),
+                "conversation_params": {"conversation_id": conversation}
+            });
+            let affinity =
+                crate::protocols::openai::responses::request_compat::body_affinity(&body)
+                    .map(str::to_owned);
+            let mut request =
+                context_from_headers(NvCreateResponse::default(), "r".into(), &headers).unwrap();
+            apply_responses_body_affinity(&mut request, &headers, affinity, conversation.is_some());
+            assert_eq!(
+                request
+                    .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+                    .ok()
+                    .as_deref()
+                    .map(SessionAffinityId::as_str),
+                conversation
+            );
+            let agent = request.get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY).ok();
+            assert_eq!(
+                agent.as_deref().map(|agent| agent.session_id.as_str()),
+                conversation,
+            );
+            if let Some(agent) = agent {
+                assert_eq!(agent.parent_session_id.as_deref(), Some("parent"));
+                assert_eq!(agent.session_final, Some(true));
+            }
+        }
+    }
 
     use super::*;
     use crate::discovery::ModelManagerError;
@@ -6916,6 +7161,126 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn context_overflow_is_a_typed_failed_sse_response() {
+        for diagnostic in [
+            "Input length (100) exceeds max_seq_len (64).",
+            "This model's maximum context length is 64 tokens.",
+            "Prompt length (100) exceeds maximum input length (64).",
+        ] {
+            for error_type in [
+                None,
+                Some(dynamo_runtime::error::ErrorType::Backend(
+                    dynamo_runtime::error::BackendError::InvalidArgument,
+                )),
+                Some(dynamo_runtime::error::ErrorType::InvalidArgument),
+            ] {
+                let diagnostic = format!("{diagnostic} private backend diagnostic");
+                let event: Annotated<NvCreateChatCompletionStreamResponse> = Annotated {
+                    event: Some("error".to_string()),
+                    comment: error_type.is_none().then(|| {
+                        vec![
+                            serde_json::json!({
+                                "code": 400,
+                                "message": diagnostic,
+                            })
+                            .to_string(),
+                        ]
+                    }),
+                    data: None,
+                    id: None,
+                    error: error_type.map(|error_type| {
+                        dynamo_runtime::error::DynamoError::builder()
+                            .error_type(error_type)
+                            .message(diagnostic)
+                            .build()
+                    }),
+                };
+                let backend_error = extract_backend_error_if_present(&event).unwrap();
+                let error = backend_error_response(backend_error, false);
+                assert_eq!(error.1.message, "Request exceeds the model context length");
+                assert_eq!(error.1.details.as_ref().unwrap()["type"], "context_length");
+                assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                assert!(is_context_length_error(&error));
+                assert_eq!(
+                    responses_error_code(&error, false),
+                    ResponseErrorCode::InvalidPrompt
+                );
+                assert_eq!(
+                    responses_error_code(&error, true),
+                    ResponseErrorCode::Other("context_length_exceeded".into())
+                );
+                let response =
+                    responses_overflow_stream("m".into(), ResponseParams::default(), None, &error);
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let text = std::str::from_utf8(&body).unwrap();
+                assert!(!text.contains("private backend diagnostic"));
+                let events: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|event| event["type"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    [
+                        "response.created",
+                        "response.in_progress",
+                        "response.failed"
+                    ]
+                );
+                assert_eq!(
+                    events[2]["response"]["error"]["code"],
+                    "context_length_exceeded"
+                );
+                assert_eq!(events[0]["response"]["id"], events[2]["response"]["id"]);
+                for (index, event) in events.iter().enumerate() {
+                    assert_eq!(event["sequence_number"], index);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_invalid_arguments_are_not_context_overflows() {
+        let error = ErrorMessage::from_anyhow(
+            crate::protocols::common::invalid_argument_error("temperature must be nonnegative"),
+            "validation failed",
+        );
+        assert!(!is_context_length_error(&error));
+        assert_eq!(
+            responses_error_code(&error, true),
+            ResponseErrorCode::InvalidPrompt
+        );
+        let invalid_argument = dynamo_runtime::error::DynamoError::builder()
+            .error_type(dynamo_runtime::error::ErrorType::Backend(
+                dynamo_runtime::error::BackendError::InvalidArgument,
+            ))
+            .message("Input length (100) exceeds max_seq_len (64).")
+            .build();
+        let event: Annotated<NvCreateChatCompletionStreamResponse> = Annotated {
+            event: Some("error".to_string()),
+            comment: None,
+            data: None,
+            id: None,
+            error: Some(
+                dynamo_runtime::error::DynamoError::builder()
+                    .error_type(dynamo_runtime::error::ErrorType::Unavailable)
+                    .message("worker unavailable")
+                    .cause(invalid_argument)
+                    .build(),
+            ),
+        };
+        let error =
+            backend_error_response(extract_backend_error_if_present(&event).unwrap(), false);
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_context_length_error(&error));
+    }
     #[tokio::test]
     async fn pooling_bytes_response_has_vllm_metadata_and_chunked_body() {
         let response = build_pooling_binary_response(
@@ -7924,6 +8289,7 @@ mod tests {
         let backend_payload = std::io::Error::other("backend payload");
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "unsupported image format".to_string(),
                 status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 semantic: Some(dynamo_runtime::error::DynamoError::from(
@@ -7944,6 +8310,7 @@ mod tests {
     fn classified_internal_error_ignores_backend_http_status() {
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "backend unavailable".to_string(),
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 semantic: Some(
@@ -8278,6 +8645,7 @@ mod tests {
         // admission path at every configured value.
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "Worker local total request limit reached (32/32)".to_string(),
                 status: StatusCode::TOO_MANY_REQUESTS,
                 semantic: None,
@@ -8301,6 +8669,7 @@ mod tests {
             .build();
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "backend stopped".to_string(),
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 semantic: Some(cancelled),
@@ -8323,6 +8692,7 @@ mod tests {
             .build();
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "backend stopped".to_string(),
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 semantic: Some(cancelled),

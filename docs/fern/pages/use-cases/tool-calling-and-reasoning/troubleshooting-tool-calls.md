@@ -132,6 +132,38 @@ response provides them, and compare it against `message.content` and
 `message.tool_calls` to decide whether the issue is in the model output,
 the parser configuration, or the parser logic.
 
+## Custom-Tool Grammar Constraints
+
+If generated custom-tool input does not match its declared regex or Lark
+grammar, check the endpoint's decoding contract. Dynamo's Responses endpoint
+accepts these descriptors as **advisory** metadata. The model generates a
+freeform `input` string; decoding does not enforce the grammar. This also
+applies to tools grouped under a named namespace and tool declarations supplied
+by a client-side tool-search result. The response retains the descriptor.
+
+The frontend logs this exact warning once per process:
+
+```text
+Responses custom-tool grammars are advisory; decoding does not enforce regex or Lark constraints
+```
+
+Validate each generated custom-tool input before executing it. An HTTP 200
+response or echoed descriptor does not establish grammar enforcement. If your
+client requires constrained output, use an endpoint that enforces that grammar.
+Function-tool and response-format guided decoding use separate constraints; see
+[Structural Tags](structural-tag.md).
+
+Older frontends can reject a Responses custom-tool grammar with:
+
+```text
+Custom tool grammar formats are not supported
+```
+
+If freeform input is acceptable, replace the custom tool's format with
+`{"type":"text"}` and validate the generated input in your application. This
+workaround does not enforce the original grammar. Chat Completions also rejects
+grammar formats; use its `text` format for freeform custom tools.
+
 ## Parser Generation Routing
 
 Set `DYN_PARSER_VERSION` on the frontend running the `dynamo` processor and on workers that build parser-dependent guidance. Workers publish `--dyn-tool-call-parser` and `--dyn-reasoning-parser`; the frontend runs parsing. Restart after changing the environment because version selection is cached. For release-specific parser versions, inspect `Cargo.toml` and `Cargo.lock` in your release checkout. The development [Cargo.toml](https://github.com/ai-dynamo/dynamo/blob/main/Cargo.toml) and [Cargo.lock](https://github.com/ai-dynamo/dynamo/blob/main/Cargo.lock) links track `main`. The frontend-crates library examples may target a newer release.
@@ -185,6 +217,19 @@ Unified resolves prompt-prefilled reasoning after template rendering: an opener 
 For MiniMax M3, explicit `guided_json`, `guided_regex`, `guided_choice`, or `guided_grammar` disables thinking by default when no explicit thinking control is supplied. Explicit-guided requests that enable reasoning require `--dyn-reasoning-parser minimax_m3`; a tool parser alone does not activate guided-reasoning support. When the rendered prompt ends in `<mm:think>`, both parser routes start in reasoning: reasoning streams before `</mm:think>` arrives and remains `reasoning_content` if truncated. Configure dynamo.vllm with `--reasoning-parser minimax_m3`, or dynamo.sglang with `--reasoning-parser minimax-m3`, to defer the answer grammar until reasoning ends; dynamo.frontend also sends SGLang's `require_reasoning` signal for these prompt-open requests. The frontend does not infer grammar timing from generated text. Adaptive/M3.1 templates that leave reasoning unopened receive no additional gate.
 
 Forced choices can install guided JSON or family-native structural tags. A mode requiring the V1 jail cannot silently fall back under explicit V2; unsupported combinations are rejected. See [Structural Tags](structural-tag.md) for builder availability and backend activation.
+
+## Incomplete GLM Tool Calls
+
+On the TensorRT-LLM OpenEngine sidecar, an incomplete native GLM tool call at a
+backend `stop` or `tool_calls` finish or unexpected stream end triggers a
+`BackendProtocol` failure. Both unified/V2 and legacy/V1 GLM parsing enforce
+this behavior.
+
+Already-parsed text is emitted before a streaming failure; a non-streaming
+request fails instead of returning a partial result. A backend `length` finish
+retains its token-limit behavior. Deployments without this capability retain
+their existing length/suppression behavior. Check the raw generated tool-call
+envelope and backend finish reason when investigating this error.
 
 ## Known limitations and follow-up
 

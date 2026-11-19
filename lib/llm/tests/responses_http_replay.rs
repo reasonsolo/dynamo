@@ -33,6 +33,48 @@ use http_harness::{
 const ENV: [(&str, Option<&str>); 1] = [(DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("0"))];
 
 #[tokio::test]
+#[serial]
+async fn duplicate_fields_fail_before_responses_dispatch() {
+    temp_env::async_with_vars(ENV, async {
+        let svc = HarnessService::start([]).await;
+        let mut cases = Vec::new();
+        for (field, value) in [
+            ("model", json!("other-model")),
+            ("input", json!("other-input")),
+            ("tools", json!([])),
+            ("stream", json!(true)),
+        ] {
+            cases.push(format!(
+                r#"{{"model":"{MODEL}","input":"ping","tools":[],"stream":false,"{field}":{value}}}"#
+            ));
+        }
+        cases.push(format!(r#"{{"model":"{MODEL}","input":"ping","nvext":{{"metadata_upload":{{"kind":"generation_artifact","contents":[],"mode":"object_store","destination":{{"kind":"presigned_http_put","url":"https://example.com/upload","required_headers":{{"X-Token":"private-a","X-Token":"private-b"}},"expires_at":"2030-01-01T00:00:00Z","max_bytes":100,"object_id":"object"}}}}}}}}"#));
+        cases.push(format!(
+            r#"{{"model":"{MODEL}","input":"ping","metadata":{{"private-key":"private-a","private-key":"private-b"}}}}"#
+        ));
+        for body in cases {
+            let response = svc
+                .client
+                .post(format!("{}/v1/responses", svc.base_url))
+                .header("content-type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let body: Value = response.json().await.unwrap();
+            let message = body["message"].as_str().unwrap();
+            assert!(message.contains("duplicate JSON object field at line "), "{message}");
+            assert!(!message.contains("X-Token") && !message.contains("private-"), "{message}");
+            assert!(!message.contains("other-model") && !message.contains("other-input"), "{message}");
+        }
+        assert!(svc.engine.take_requests().await.is_empty());
+        svc.shutdown().await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn responses_sse_requires_terminal_event_without_trailers() {
     for terminal in [
         "response.completed",
@@ -58,6 +100,108 @@ async fn responses_sse_requires_terminal_event_without_trailers() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn context_overflow_events_require_the_selected_deployment_capability() {
+    use std::sync::Arc;
+
+    use dynamo_llm::local_model::runtime_config::RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY;
+    use dynamo_llm::model_card::ModelDeploymentCard;
+    use dynamo_runtime::config::environment_names::llm::DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS;
+
+    temp_env::async_with_vars(
+        [ENV[0], (DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS, Some("1000"))],
+        async {
+            let mut partial = load_agent_fixture("text.sse").await.unwrap();
+            let terminal = partial
+                .iter()
+                .position(|chunk| {
+                    chunk.data.as_ref().is_some_and(|data| {
+                        data.inner
+                            .choices
+                            .iter()
+                            .any(|choice| choice.finish_reason.is_some())
+                    })
+                })
+                .unwrap();
+            partial.truncate(terminal);
+            for enabled in [false, true] {
+                for phase in ["generate", "preflight", "streaming"] {
+                    const DIAGNOSTIC: &str = "Input length (100) exceeds max_seq_len (64).";
+                    let engine = if phase == "generate" {
+                        scripted_chat_engine::ScriptedChatEngine::with_generate_error(
+                            DynamoError::builder()
+                                .error_type(DynamoErrorType::InvalidArgument)
+                                .message(DIAGNOSTIC)
+                                .public_message(DIAGNOSTIC)
+                                .build(),
+                        )
+                    } else {
+                        scripted_chat_engine::ScriptedChatEngine::with_backend_error(
+                            if phase == "streaming" {
+                                partial.clone()
+                            } else {
+                                vec![]
+                            },
+                            DynamoError::msg(json!({"code":400,"message":DIAGNOSTIC}).to_string()),
+                        )
+                    };
+                    let mut card = ModelDeploymentCard::with_name_only(MODEL);
+                    if enabled {
+                        card.runtime_config
+                            .set_engine_specific(RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY, true)
+                            .unwrap();
+                    }
+                    let svc =
+                        HarnessService::start_with_engine_and_card(Arc::new(engine), card).await;
+                    let response = post_responses(
+                        &svc,
+                        &json!({
+                            "model": MODEL, "input": "ping", "stream": true
+                        }),
+                    )
+                    .await;
+                    if !enabled && phase != "streaming" {
+                        assert_eq!(
+                            response.status(),
+                            reqwest::StatusCode::BAD_REQUEST,
+                            "{phase}"
+                        );
+                    } else {
+                        assert_eq!(
+                            response.status(),
+                            reqwest::StatusCode::OK,
+                            "{enabled}/{phase}"
+                        );
+                        let events = parse_responses_sse(&response.text().await.unwrap())
+                            .await
+                            .unwrap();
+                        let failed = &events[event_position(&events, "response.failed")];
+                        assert_eq!(
+                            failed.data["response"]["error"]["code"],
+                            if enabled {
+                                "context_length_exceeded"
+                            } else {
+                                "invalid_prompt"
+                            },
+                            "{enabled}/{phase}"
+                        );
+                        assert!(!events.iter().any(|event| event.event == "error"));
+                        assert!(
+                            events
+                                .iter()
+                                .all(|event| event.event != "response.completed")
+                        );
+                    }
+                    assert_eq!(svc.engine.take_requests().await.len(), 1);
+                    svc.shutdown().await;
+                }
+            }
+        },
+    )
+    .await;
 }
 
 /// Unsupported tool definitions return HTTP 400 before backend dispatch for both
@@ -93,40 +237,61 @@ async fn unsupported_hosted_tools_fail_before_dispatch_or_streaming() {
     .await;
 }
 
-/// Unsupported choices return HTTP 400 without dispatch for unary and streaming
-/// requests even when the supplied function tool definitions are valid.
-/// Custom tools now share the function-template adapter while retaining their
-/// namespace and custom identity in the public Responses surface.
+/// Responses accepts custom grammar descriptors as advisory metadata, matching
+/// TRT-LLM's freeform input adapter for top-level and namespaced declarations.
 #[tokio::test]
 #[serial]
-async fn namespaced_custom_tools_are_accepted_and_echoed() {
+async fn custom_tool_formats_are_accepted_and_echoed() {
     temp_env::async_with_vars(ENV, async {
+        let formats = [
+            json!({"type":"text"}),
+            json!({"type":"grammar","syntax":"regex","definition":"[a-z]+"}),
+            json!({"type":"grammar","syntax":"lark","definition":"start: \"patch\""}),
+        ];
         let script = load_agent_fixture("text.sse").await.unwrap();
-        let svc = HarnessService::start([script.clone(), script]).await;
-        for stream in [false, true] {
-            let response = post_responses(
-                &svc,
-                &json!({
-                    "model": MODEL, "input":"ping", "stream":stream,
-                    "tools":[{"type":"namespace","name":"custom","description":"Custom tools",
-                        "tools":[{"type":"custom","name":"run","format":{"type":"text"}}]}]
-                }),
-            )
-            .await;
-            assert_eq!(response.status(), reqwest::StatusCode::OK);
-            let body = response.text().await.unwrap();
-            if stream {
-                assert!(body.contains("response.completed"));
-            } else {
-                let body: Value = serde_json::from_str(&body).unwrap();
-                assert_eq!(body["tools"][0]["type"], "namespace");
-                assert_eq!(body["tools"][0]["tools"][0]["type"], "custom");
+        let count = formats.len() * 4;
+        let svc = HarnessService::start(std::iter::repeat_n(script, count)).await;
+        for format in formats {
+            for namespaced in [false, true] {
+                for stream in [false, true] {
+                    let custom = json!({"type":"custom","name":"run","format":format});
+                    let tool = if namespaced {
+                        json!({"type":"namespace","name":"custom","description":"Custom tools","tools":[custom]})
+                    } else {
+                        custom
+                    };
+                    let response = post_responses(&svc, &json!({
+                        "model":MODEL,"input":"ping","stream":stream,"tools":[tool]
+                    })).await;
+                    let status = response.status();
+                    let body = response.text().await.unwrap();
+                    assert_eq!(status, reqwest::StatusCode::OK, "{format}: {body}");
+                    let completed: Value = if stream {
+                        let events = parse_responses_sse(&body).await.unwrap();
+                        events.iter().find(|event| event.event == "response.completed")
+                            .unwrap().data["response"].clone()
+                    } else {
+                        serde_json::from_str(&body).unwrap()
+                    };
+                    let echoed = if namespaced {
+                        &completed["tools"][0]["tools"][0]
+                    } else {
+                        &completed["tools"][0]
+                    };
+                    assert_eq!(echoed["type"], "custom");
+                    assert_eq!(echoed["format"], format);
+                }
             }
         }
-        assert_eq!(svc.engine.take_requests().await.len(), 2);
+        let requests = svc.engine.take_requests().await;
+        assert_eq!(requests.len(), count);
+        for request in requests {
+            let tool = &request.inner.tools.as_ref().unwrap()[0];
+            assert_eq!(tool.function.parameters.as_ref().unwrap()["properties"]["input"]["type"], "string");
+            assert_ne!(tool.function.strict, Some(true));
+        }
         svc.shutdown().await;
-    })
-    .await;
+    }).await;
 }
 
 #[tokio::test]
@@ -1078,7 +1243,7 @@ async fn empty_first_arguments_do_not_finish_function_call_early() {
 #[serial]
 async fn finish_signal_publishes_function_call_before_usage_tail() {
     temp_env::async_with_vars(ENV, async {
-        let script = load_agent_fixture("fragmented-tool.sse").await.unwrap();
+        let mut script = load_agent_fixture("fragmented-tool.sse").await.unwrap();
         let split_at = script
             .iter()
             .position(|chunk| {
@@ -1088,6 +1253,16 @@ async fn finish_signal_publishes_function_call_before_usage_tail() {
                     .is_some_and(|data| data.inner.usage.is_some())
             })
             .expect("fragmented-tool fixture has no usage chunk");
+        let usage = script[split_at]
+            .data
+            .as_mut()
+            .unwrap()
+            .inner
+            .usage
+            .as_mut()
+            .unwrap();
+        usage.prompt_tokens_details =
+            Some(serde_json::from_value(json!({"cached_tokens": 12})).unwrap());
         let (svc, gate) = HarnessService::start_with_gated_tail(script, split_at).await;
         let response = post_responses(
             &svc,
@@ -1095,6 +1270,7 @@ async fn finish_signal_publishes_function_call_before_usage_tail() {
                 "model": MODEL,
                 "input": "List /tmp",
                 "stream": true,
+                "parallel_tool_calls": false,
                 "max_output_tokens": 128,
                 "tools": [tool("list_directory")]
             }),
@@ -1154,6 +1330,14 @@ async fn finish_signal_publishes_function_call_before_usage_tail() {
                 .any(|event| event.event == "response.completed")
         );
 
+        let completed = events
+            .iter()
+            .find(|event| event.event == "response.completed")
+            .unwrap();
+        assert_eq!(
+            completed.data["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            12
+        );
         svc.shutdown().await;
     })
     .await;
