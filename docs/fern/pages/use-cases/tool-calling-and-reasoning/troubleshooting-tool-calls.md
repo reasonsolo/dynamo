@@ -164,6 +164,19 @@ If freeform input is acceptable, replace the custom tool's format with
 workaround does not enforce the original grammar. Chat Completions also rejects
 grammar formats; use its `text` format for freeform custom tools.
 
+## Incomplete GLM Tool Calls
+
+On the TensorRT-LLM OpenEngine sidecar, an incomplete native GLM tool call at a
+backend `stop` or `tool_calls` finish or unexpected stream end triggers a
+`BackendProtocol` failure. Both unified/V2 and legacy/V1 GLM parsing enforce
+this behavior.
+
+Already-parsed text is emitted before a streaming failure; a non-streaming
+request fails instead of returning a partial result. A backend `length` finish
+retains its token-limit behavior. Deployments without this capability retain
+their existing length/suppression behavior. Check the raw generated tool-call
+envelope and backend finish reason when investigating this error.
+
 ## Parser Generation Routing
 
 Set `DYN_PARSER_VERSION` on the frontend running the `dynamo` processor and on workers that build parser-dependent guidance. Workers publish `--dyn-tool-call-parser` and `--dyn-reasoning-parser`; the frontend runs parsing. Restart after changing the environment because version selection is cached. For release-specific parser versions, inspect `Cargo.toml` and `Cargo.lock` in your release checkout. The development [Cargo.toml](https://github.com/ai-dynamo/dynamo/blob/main/Cargo.toml) and [Cargo.lock](https://github.com/ai-dynamo/dynamo/blob/main/Cargo.lock) links track `main`. The frontend-crates library examples may target a newer release.
