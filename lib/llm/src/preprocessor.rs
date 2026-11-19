@@ -16034,7 +16034,7 @@ responses_tools: None,
                             let case = format!("{parser} {tail:?} {control}={requested} {fields}");
                             if !requested && reasoning_open {
                                 let error =
-                                    result.err().expect("open thinking-off prefill must fail");
+                                    result.expect_err("open thinking-off prefill must fail");
                                 let error = error.downcast_ref::<DynamoError>().unwrap();
                                 assert_eq!(
                                     error.error_type(),
@@ -16100,9 +16100,7 @@ responses_tools: None,
                     .unwrap();
                 let result = preprocessor.preprocess_request(&request, None).await;
                 if add_generation_prompt && !requested && !tail.trim_end().ends_with("</think>") {
-                    let error = result
-                        .err()
-                        .expect("unknown thinking-off prefill must fail");
+                    let error = result.expect_err("unknown thinking-off prefill must fail");
                     let error = error.downcast_ref::<DynamoError>().unwrap();
                     assert_eq!(error.error_type(), ErrorType::InvalidArgument);
                     assert!(
