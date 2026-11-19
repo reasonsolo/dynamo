@@ -161,7 +161,7 @@ async fn context_overflow_events_require_the_selected_deployment_capability() {
                             },
                             "{enabled}/{phase}"
                         );
-                        assert_eq!(events.iter().any(|event| event.event == "error"), !enabled);
+                        assert!(!events.iter().any(|event| event.event == "error"));
                         assert!(
                             events
                                 .iter()
@@ -1244,7 +1244,7 @@ async fn empty_first_arguments_do_not_finish_function_call_early() {
 #[serial]
 async fn finish_signal_publishes_function_call_before_usage_tail() {
     temp_env::async_with_vars(ENV, async {
-        let script = load_agent_fixture("fragmented-tool.sse").await.unwrap();
+        let mut script = load_agent_fixture("fragmented-tool.sse").await.unwrap();
         let split_at = script
             .iter()
             .position(|chunk| {
@@ -1254,6 +1254,16 @@ async fn finish_signal_publishes_function_call_before_usage_tail() {
                     .is_some_and(|data| data.inner.usage.is_some())
             })
             .expect("fragmented-tool fixture has no usage chunk");
+        let usage = script[split_at]
+            .data
+            .as_mut()
+            .unwrap()
+            .inner
+            .usage
+            .as_mut()
+            .unwrap();
+        usage.prompt_tokens_details =
+            Some(serde_json::from_value(json!({"cached_tokens": 12})).unwrap());
         let (svc, gate) = HarnessService::start_with_gated_tail(script, split_at).await;
         let response = post_responses(
             &svc,
@@ -1261,6 +1271,7 @@ async fn finish_signal_publishes_function_call_before_usage_tail() {
                 "model": MODEL,
                 "input": "List /tmp",
                 "stream": true,
+                "parallel_tool_calls": false,
                 "max_output_tokens": 128,
                 "tools": [tool("list_directory")]
             }),
@@ -1320,6 +1331,14 @@ async fn finish_signal_publishes_function_call_before_usage_tail() {
                 .any(|event| event.event == "response.completed")
         );
 
+        let completed = events
+            .iter()
+            .find(|event| event.event == "response.completed")
+            .unwrap();
+        assert_eq!(
+            completed.data["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            12
+        );
         svc.shutdown().await;
     })
     .await;

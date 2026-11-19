@@ -4180,21 +4180,25 @@ async fn check_reject_media_openai(status: StatusCode) {
                 ))
             })
     });
-    let tool_image_case = (
-        "/v1/responses",
-        "image_url",
-        serde_json::json!({
-            "model": "text-only", "stream": true,
-            "input": [{"type": "function_call_output", "call_id": "call_1", "output": [
-                {"type": "input_image", "file_id": "file-image"}
-            ]}]
-        }),
-    );
+    let tool_image_cases = ["function_call_output", "custom_tool_call_output"]
+        .into_iter()
+        .map(|kind| {
+            (
+                "/v1/responses",
+                "image_url",
+                serde_json::json!({
+                    "model": "text-only", "stream": true,
+                    "input": [{"type": kind, "call_id": "call_1", "output": [
+                        {"type": "input_image", "file_id": "file-image"}
+                    ]}]
+                }),
+            )
+        });
     for (path, content_type, request) in cases
         .into_iter()
         .chain(url_media_cases)
         .chain(responses_image_cases)
-        .chain([tool_image_case])
+        .chain(tool_image_cases)
     {
         let metric_model = state
             .manager()
@@ -4581,6 +4585,19 @@ async fn test_image_omission_uses_model_modalities_without_global_rejection() {
         .build()
         .unwrap();
     for name in ["text-only", "vision", "unknown"] {
+        let tool_results = ["function_call_output", "custom_tool_call_output"].into_iter().map(|kind| {
+            let call = if kind == "function_call_output" {
+                serde_json::json!({"type":"function_call", "call_id":"call_1", "name":"inspect", "arguments":"{}"})
+            } else {
+                serde_json::json!({"type":"custom_tool_call", "id":"custom_1", "call_id":"call_1", "name":"inspect", "input":""})
+            };
+            ("/v1/responses", serde_json::json!({"input":[call,
+                {"type":kind, "call_id":"call_1", "output":[
+                    {"type":"input_text", "text":"before"},
+                    {"type":"input_image", "image_url":"data:image/png;base64,AAAA"},
+                    {"type":"input_text", "text":"after"}
+                ]}]}))
+        });
         for (path, mut body) in [
             (
                 "/v1/chat/completions",
@@ -4600,8 +4617,12 @@ async fn test_image_omission_uses_model_modalities_without_global_rejection() {
                 {"type":"text","text":"before"}, {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
                 {"type":"text","text":"after"}]}]}),
             ),
-        ] {
+        ].into_iter().chain(tool_results) {
             body["model"] = serde_json::json!(name);
+            let input_kind = body.pointer("/input/0/type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("message")
+                .to_owned();
             let response = client
                 .post(format!("http://127.0.0.1:{port}{path}"))
                 .json(&body)
@@ -4610,7 +4631,7 @@ async fn test_image_omission_uses_model_modalities_without_global_rejection() {
                 .unwrap();
             let status = response.status();
             let body = response.text().await.unwrap();
-            assert_eq!(status, StatusCode::OK, "{name} {path}: {body}");
+            assert_eq!(status, StatusCode::OK, "{name} {path} {input_kind}: {body}");
             let captured = engine.messages.lock().unwrap().take().unwrap();
             let captured = captured.to_string();
             assert_eq!(
@@ -4633,6 +4654,24 @@ async fn test_image_omission_uses_model_modalities_without_global_rejection() {
                 );
             }
         }
+    }
+    for kind in ["function_call_output", "custom_tool_call_output"] {
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .json(&serde_json::json!({"model":"text-only", "input":[
+                {"type":kind, "call_id":"call_1", "output":[
+                    {"type":"input_image", "file_id":"file-image"}
+                ]}
+            ]}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+        let captured = engine.messages.lock().unwrap().take().unwrap().to_string();
+        assert!(captured.contains("[image omitted]"));
+        assert!(!captured.contains("image_url") && !captured.contains("file-image"));
     }
     let mut counts = Vec::new();
     for part in [

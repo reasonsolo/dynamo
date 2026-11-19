@@ -13572,7 +13572,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn glm_literal_closer_cannot_hide_an_unfinished_sibling() {
-        let first = eight_family_calls("before </tool_call> \"")
+        let value = "before </tool_call> \"";
+        let first = eight_family_calls(value)
             .into_iter()
             .find(|(family, _)| *family == GLM47_UNIFIED_FAMILY)
             .unwrap()
@@ -13589,6 +13590,11 @@ pub(crate) mod tests {
         .unwrap();
         assert!(output.incomplete_native_call);
         assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output.tool_calls[0].function.arguments)
+                .unwrap()["content"],
+            value
+        );
         for split in input.char_indices().map(|(at, _)| at) {
             let output = apply_stream(
                 stream::iter([chunk(&input[..split], false), chunk(&input[split..], true)]),
@@ -13600,6 +13606,17 @@ pub(crate) mod tests {
             )
             .collect::<Vec<_>>()
             .await;
+            let arguments: String = collect_choices(&output)
+                .iter()
+                .flat_map(|choice| choice.delta.tool_calls.iter().flatten())
+                .filter(|call| call.index == 0)
+                .filter_map(|call| call.function.as_ref()?.arguments.as_deref())
+                .collect();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&arguments).unwrap()["content"],
+                value,
+                "split={split}"
+            );
             assert_eq!(
                 output.last().unwrap().error.as_ref().unwrap().class(),
                 ErrorClass::BackendProtocol,

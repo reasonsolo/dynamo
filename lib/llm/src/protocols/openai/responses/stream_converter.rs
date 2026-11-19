@@ -20,8 +20,7 @@ use dynamo_protocols::types::responses::{
     ReasoningTextContent, RefusalContent, RequestToolChoiceParam, Response, ResponseCompletedEvent,
     ResponseContentPartAddedEvent, ResponseContentPartDoneEvent, ResponseCreatedEvent,
     ResponseCustomToolCallInputDeltaEvent, ResponseCustomToolCallInputDoneEvent, ResponseError,
-    ResponseErrorCode, ResponseErrorEvent, ResponseFailedEvent,
-    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseErrorCode, ResponseFailedEvent, ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent, ResponseInProgressEvent, ResponseIncompleteEvent,
     ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent, ResponseReasoningTextDeltaEvent,
     ResponseReasoningTextDoneEvent, ResponseRefusalDeltaEvent, ResponseRefusalDoneEvent,
@@ -1516,21 +1515,6 @@ impl ResponseStreamConverter {
         self.close_open_message_item(events, output_status);
         self.append_pending_function_call_done_events(events, output_status, false);
 
-        let wire_code = serde_json::to_value(&error.code)
-            .ok()
-            .and_then(|value| value.as_str().map(str::to_owned));
-        // Overflow recovery consumes response.failed; do not precede it with
-        // a standalone error that may end the client's read loop.
-        if !matches!(&error.code, ResponseErrorCode::Other(code) if code == "context_length_exceeded")
-        {
-            let error_event = ResponseStreamEvent::ResponseError(ResponseErrorEvent {
-                sequence_number: self.next_seq(),
-                code: wire_code,
-                message: error.message.clone(),
-                param: None,
-            });
-            events.push(self.make_sse_event(&error_event));
-        }
         let mut response =
             self.make_response(Status::Failed, self.output_with_status(output_status));
         response.error = Some(error);
@@ -2650,7 +2634,6 @@ mod tests {
                 "response.reasoning_text.done".to_string(),
                 "response.content_part.done".to_string(),
                 "response.output_item.done".to_string(),
-                "error".to_string(),
                 "response.failed".to_string(),
             ]
         );
@@ -2684,10 +2667,7 @@ mod tests {
             code: ResponseErrorCode::ServerError,
             message: "backend error".to_string(),
         });
-        assert_eq!(
-            event_types(&events),
-            vec!["error".to_string(), "response.failed".to_string()]
-        );
+        assert_eq!(event_types(&events), vec!["response.failed".to_string()]);
 
         let output = conv.output_with_status(OutputStatus::Incomplete);
         let OutputItem::FunctionCall(call) = &output[0] else {
@@ -2713,7 +2693,6 @@ mod tests {
                 "response.output_text.done".to_string(),
                 "response.content_part.done".to_string(),
                 "response.output_item.done".to_string(),
-                "error".to_string(),
                 "response.failed".to_string(),
             ]
         );

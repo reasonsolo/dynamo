@@ -3173,6 +3173,11 @@ impl BackendErrorInfo {
     }
 
     fn with_semantic(mut self, error: Option<&dynamo_runtime::error::DynamoError>) -> Self {
+        if self.status == StatusCode::BAD_REQUEST
+            && let Some(error) = error.filter(|error| is_invalid_argument(error))
+        {
+            self.context_overflow |= is_context_overflow_diagnostic(error.message());
+        }
         self.semantic = error.cloned();
         self
     }
@@ -3573,9 +3578,13 @@ fn backend_error_response(backend_error: BackendErrorInfo, record_failure: bool)
                 "backend.unknown" | "runtime.unclassified"
             );
         if is_classified
-            && let Some(response) =
+            && let Some(mut response) =
                 ErrorMessage::from_semantic_error_with_recording(error, record_failure)
         {
+            if context_overflow && response.0 == StatusCode::BAD_REQUEST {
+                response.1.message = "Request exceeds the model context length".to_string();
+                response.1.details = Some(Box::new(serde_json::json!({"type": "context_length"})));
+            }
             return response;
         }
         if matches!(http_action_for_error(error), ClientErrorAction::NoDelivery) {
@@ -4331,8 +4340,13 @@ async fn chat_completions(
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         return Err(err_response);
     }
-    // Selected once for capability admission, media policy, and dispatch.
+    // Selected once: the Beam request normalization below reads this engine's parsing
+    // options and dispatch uses this same engine, so the two cannot disagree on the
+    // worker set when one served name fronts Beam and non-Beam pools.
+    // The lookup sits inside validation, so this range nests in
+    // frontend.http.chat.validate, whose duration includes it.
     let nvtx_lookup = dynamo_nvtx_range!("frontend.http.chat.engine_lookup");
+    // Custom content requires explicit support on the same deployment used for omission.
     let engine_selection = if crate::preprocessor::has_custom_content(request.content()) {
         super::image_omission::select_chat_engine_for_capability(
             &state,
@@ -4360,6 +4374,7 @@ async fn chat_completions(
     }
 
     tracing::trace!("Getting chat completions engine for model: {}", model);
+
     let (engine, parsing_options, _) = engine_selection;
 
     // Beam route, before generic validation (which rejects what this normalizes): a
@@ -4935,6 +4950,19 @@ async fn handler_responses(
     let body = read_json_request_body(&headers, body).await?;
     let UniqueJsonValue(mut body_value) =
         parse_json_request::<UniqueJsonValue<true>>("responses", &body)?;
+    // Custom tool results share function-result conversion and media policy.
+    if let Some(items) = body_value
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in items {
+            if item.get("type").and_then(serde_json::Value::as_str)
+                == Some("custom_tool_call_output")
+            {
+                item["type"] = serde_json::json!("function_call_output");
+            }
+        }
+    }
     crate::protocols::openai::responses::request_compat::hoist_additional_tools(&mut body_value)
         .map_err(|error| responses_conversion_error_response(error.into()))?;
     let body_affinity =
@@ -5238,8 +5266,7 @@ async fn responses(
     if response_params.max_output_tokens.is_none() {
         request.insert(PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY, true);
     }
-    // Clients get public tool names and namespaces, not backend aliases;
-    // request traces record them. Skip the map clone when traces are off.
+
     if crate::request_trace::policy().emit_request_end_records()
         && let Some(tool_names) = response_params.tool_names.clone()
     {
@@ -7003,64 +7030,80 @@ mod tests {
             "This model's maximum context length is 64 tokens.",
             "Prompt length (100) exceeds maximum input length (64).",
         ] {
-            let event: Annotated<NvCreateChatCompletionStreamResponse> = Annotated {
-                event: Some("error".to_string()),
-                comment: Some(vec![
-                    serde_json::json!({
-                        "code": 400,
-                        "message": format!("{diagnostic} private backend diagnostic"),
-                    })
-                    .to_string(),
-                ]),
-                data: None,
-                id: None,
-                error: None,
-            };
-            let backend_error = extract_backend_error_if_present(&event).unwrap();
-            let error = backend_error_response(backend_error, false);
-            assert_eq!(error.1.message, "Request exceeds the model context length");
-            assert_eq!(error.1.details.as_ref().unwrap()["type"], "context_length");
-            assert_eq!(error.0, StatusCode::BAD_REQUEST);
-            assert!(is_context_length_error(&error));
-            assert_eq!(
-                responses_error_code(&error, false),
-                ResponseErrorCode::InvalidPrompt
-            );
-            assert_eq!(
-                responses_error_code(&error, true),
-                ResponseErrorCode::Other("context_length_exceeded".into())
-            );
-            let response =
-                responses_overflow_stream("m".into(), ResponseParams::default(), None, &error);
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                .await
-                .unwrap();
-            let text = std::str::from_utf8(&body).unwrap();
-            assert!(!text.contains("private backend diagnostic"));
-            let events: Vec<serde_json::Value> = text
-                .lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect();
-            assert_eq!(
-                events
-                    .iter()
-                    .map(|event| event["type"].as_str().unwrap())
-                    .collect::<Vec<_>>(),
-                [
-                    "response.created",
-                    "response.in_progress",
-                    "response.failed"
-                ]
-            );
-            assert_eq!(
-                events[2]["response"]["error"]["code"],
-                "context_length_exceeded"
-            );
-            assert_eq!(events[0]["response"]["id"], events[2]["response"]["id"]);
-            for (index, event) in events.iter().enumerate() {
-                assert_eq!(event["sequence_number"], index);
+            for error_type in [
+                None,
+                Some(dynamo_runtime::error::ErrorType::Backend(
+                    dynamo_runtime::error::BackendError::InvalidArgument,
+                )),
+                Some(dynamo_runtime::error::ErrorType::InvalidArgument),
+            ] {
+                let diagnostic = format!("{diagnostic} private backend diagnostic");
+                let event: Annotated<NvCreateChatCompletionStreamResponse> = Annotated {
+                    event: Some("error".to_string()),
+                    comment: error_type.is_none().then(|| {
+                        vec![
+                            serde_json::json!({
+                                "code": 400,
+                                "message": diagnostic,
+                            })
+                            .to_string(),
+                        ]
+                    }),
+                    data: None,
+                    id: None,
+                    error: error_type.map(|error_type| {
+                        dynamo_runtime::error::DynamoError::builder()
+                            .error_type(error_type)
+                            .message(diagnostic)
+                            .build()
+                    }),
+                };
+                let backend_error = extract_backend_error_if_present(&event).unwrap();
+                let error = backend_error_response(backend_error, false);
+                assert_eq!(error.1.message, "Request exceeds the model context length");
+                assert_eq!(error.1.details.as_ref().unwrap()["type"], "context_length");
+                assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                assert!(is_context_length_error(&error));
+                assert_eq!(
+                    responses_error_code(&error, false),
+                    ResponseErrorCode::InvalidPrompt
+                );
+                assert_eq!(
+                    responses_error_code(&error, true),
+                    ResponseErrorCode::Other("context_length_exceeded".into())
+                );
+                let response =
+                    responses_overflow_stream("m".into(), ResponseParams::default(), None, &error);
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let text = std::str::from_utf8(&body).unwrap();
+                assert!(!text.contains("private backend diagnostic"));
+                let events: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|event| event["type"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    [
+                        "response.created",
+                        "response.in_progress",
+                        "response.failed"
+                    ]
+                );
+                assert_eq!(
+                    events[2]["response"]["error"]["code"],
+                    "context_length_exceeded"
+                );
+                assert_eq!(events[0]["response"]["id"], events[2]["response"]["id"]);
+                for (index, event) in events.iter().enumerate() {
+                    assert_eq!(event["sequence_number"], index);
+                }
             }
         }
     }
@@ -7127,6 +7170,29 @@ mod tests {
             responses_error_code(&error, true),
             ResponseErrorCode::InvalidPrompt
         );
+        let invalid_argument = dynamo_runtime::error::DynamoError::builder()
+            .error_type(dynamo_runtime::error::ErrorType::Backend(
+                dynamo_runtime::error::BackendError::InvalidArgument,
+            ))
+            .message("Input length (100) exceeds max_seq_len (64).")
+            .build();
+        let event: Annotated<NvCreateChatCompletionStreamResponse> = Annotated {
+            event: Some("error".to_string()),
+            comment: None,
+            data: None,
+            id: None,
+            error: Some(
+                dynamo_runtime::error::DynamoError::builder()
+                    .error_type(dynamo_runtime::error::ErrorType::Unavailable)
+                    .message("worker unavailable")
+                    .cause(invalid_argument)
+                    .build(),
+            ),
+        };
+        let error =
+            backend_error_response(extract_backend_error_if_present(&event).unwrap(), false);
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_context_length_error(&error));
     }
 
     use super::*;
@@ -8217,6 +8283,7 @@ mod tests {
         let backend_payload = std::io::Error::other("backend payload");
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "unsupported image format".to_string(),
                 status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 semantic: Some(dynamo_runtime::error::DynamoError::from(
@@ -8237,6 +8304,7 @@ mod tests {
     fn classified_internal_error_ignores_backend_http_status() {
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "backend unavailable".to_string(),
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 semantic: Some(
@@ -8571,6 +8639,7 @@ mod tests {
         // admission path at every configured value.
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "Worker local total request limit reached (32/32)".to_string(),
                 status: StatusCode::TOO_MANY_REQUESTS,
                 semantic: None,
@@ -8594,6 +8663,7 @@ mod tests {
             .build();
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "backend stopped".to_string(),
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 semantic: Some(cancelled),
@@ -8616,6 +8686,7 @@ mod tests {
             .build();
         let response = backend_error_response(
             BackendErrorInfo {
+                context_overflow: false,
                 message: "backend stopped".to_string(),
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 semantic: Some(cancelled),

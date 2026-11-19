@@ -1495,6 +1495,11 @@ mod tests {
             Err(ModelManagerError::ModelNotFound(_))
         ));
 
+        assert!(matches!(
+            model
+                .get_chat_engine_with_image_policy_for_capability(Some(JSON_MULTIMODAL_CAPABILITY)),
+            Err(ModelManagerError::ModelNotFound(_))
+        ));
         model.add_worker_set("text".to_string(), chat_set("text", false));
         assert!(
             model
@@ -1503,6 +1508,12 @@ mod tests {
                 .is_none()
         );
 
+        assert!(
+            model
+                .get_chat_engine_with_image_policy_for_capability(Some(JSON_MULTIMODAL_CAPABILITY))
+                .unwrap()
+                .is_none()
+        );
         let mut idle = WorkerSet::new("idle".to_string(), "idle-sum".to_string(), {
             let mut card = ModelDeploymentCard::default();
             card.runtime_config
@@ -1519,6 +1530,11 @@ mod tests {
             Err(ModelManagerError::ModelUnavailable(_))
         ));
 
+        assert!(matches!(
+            model
+                .get_chat_engine_with_image_policy_for_capability(Some(JSON_MULTIMODAL_CAPABILITY)),
+            Err(ModelManagerError::ModelUnavailable(_))
+        ));
         let flagged = chat_set("vllm", true);
         let flagged_engine = flagged.chat_engine.clone().unwrap();
         model.add_worker_set("vllm".to_string(), flagged);
@@ -1528,6 +1544,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(Arc::ptr_eq(&engine, &flagged_engine));
+            let (engine, _, omit) = model
+                .get_chat_engine_with_image_policy_for_capability(Some(JSON_MULTIMODAL_CAPABILITY))
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&engine, &flagged_engine));
+            assert!(!omit, "unknown modalities must preserve images");
         }
     }
 
@@ -2737,6 +2759,10 @@ mod tests {
         let make_set = |namespace: &str, modalities: Option<Vec<&str>>, worker_type| {
             let mut card = ModelDeploymentCard::with_name_only("test");
             card.worker_type = Some(worker_type);
+            card.runtime_config.runtime_data.insert(
+                crate::local_model::runtime_config::JSON_MULTIMODAL_CAPABILITY.into(),
+                (namespace == "text").into(),
+            );
             if let Some(modalities) = modalities {
                 card.runtime_config.runtime_data.insert(
                     SUPPORTED_INPUT_MODALITIES.into(),
@@ -2756,6 +2782,16 @@ mod tests {
             let (engine, _, omit) = model.get_chat_engine_with_image_policy().unwrap();
             assert_eq!(omit, Arc::ptr_eq(&engine, &text_engine));
             assert!(Arc::ptr_eq(&engine, &text_engine) || Arc::ptr_eq(&engine, &vision_engine));
+        }
+        for _ in 0..32 {
+            let (engine, _, omit) = model
+                .get_chat_engine_with_image_policy_for_capability(Some(
+                    crate::local_model::runtime_config::JSON_MULTIMODAL_CAPABILITY,
+                ))
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&engine, &text_engine));
+            assert!(omit);
         }
         model.remove_worker_set("vision");
 

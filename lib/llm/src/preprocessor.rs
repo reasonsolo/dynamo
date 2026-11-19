@@ -3801,7 +3801,9 @@ impl OpenAIPreprocessor {
 
         // apply ignore eos if not already set
         stop_conditions.apply_ignore_eos();
-        self.apply_single_tool_call_stop(request, &mut stop_conditions)?;
+        // Tool delimiters can also occur inside arguments. Keep generation alive
+        // through the backend terminal (including usage); single-call projection
+        // happens after parsing rather than through context-free string stops.
 
         if !stop_conditions.ignore_eos.unwrap_or(false) {
             builder.eos_token_ids(eos_token_ids);
@@ -3931,46 +3933,6 @@ impl OpenAIPreprocessor {
         }
 
         Ok(builder)
-    }
-
-    fn apply_single_tool_call_stop<R: OAIChatLikeRequest + CommonExtProvider>(
-        &self,
-        request: &R,
-        stop_conditions: &mut crate::protocols::common::StopConditions,
-    ) -> Result<()> {
-        if stop_conditions.ignore_eos.unwrap_or(false) {
-            return Ok(());
-        }
-        if request.get_parallel_tool_calls() == Some(false)
-            && Self::request_has_effective_tools(request)
-            && request
-                .tool_choice()
-                .as_ref()
-                .and_then(|choice| choice.as_str())
-                != Some("none")
-            && self
-                .runtime_config
-                .runtime_data
-                .get(crate::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY)
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-        {
-            let boundaries: &[&str] = match self.tool_call_parser.as_deref() {
-                Some("kimi_k3" | "kimi-k3") => &["<|close|>call<|sep|>", "<|close|> call <|sep|>"],
-                Some("glm4" | "glm47") => &["</tool_call>"],
-                _ if self.uses_glm_parser() => &["</tool_call>"],
-                _ => &[],
-            };
-            if !boundaries.is_empty() {
-                stop_conditions.stop_visible = Some(
-                    boundaries
-                        .iter()
-                        .map(|boundary| (*boundary).to_string())
-                        .collect(),
-                );
-            }
-        }
-        Ok(())
     }
 
     fn remove_tool_parser_end_tokens_from_hidden_stops<R: OAIChatLikeRequest>(
@@ -13716,100 +13678,41 @@ responses_tools: None,
     }
 
     #[test]
-    fn single_call_boundary_requires_worker_support_and_explicit_false() {
-        use crate::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY;
-        let mut preprocessor = hidden_stop_preprocessor();
-        preprocessor.tool_call_parser = Some("kimi_k3".into());
-        for supported in [false, true] {
-            preprocessor
-                .runtime_config
-                .set_engine_specific(VISIBLE_STOP_STRINGS_CAPABILITY, supported)
-                .unwrap();
-            for parallel in [None, Some(true), Some(false)] {
-                for choice in ["auto", "none"] {
-                    let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
-                        "model":"m", "messages":[{"role":"user","content":"test"}],
-                        "tools":[{"type":"function","function":{"name":"exec","parameters":{"type":"object"}}}],
-                        "tool_choice":choice, "parallel_tool_calls":parallel
-                    })).unwrap();
-                    let mut stops = crate::protocols::common::StopConditions::default();
-                    preprocessor
-                        .apply_single_tool_call_stop(&request, &mut stops)
-                        .unwrap();
-                    assert_eq!(
-                        stops.stop_visible.is_some(),
-                        supported && parallel == Some(false) && choice != "none"
-                    );
-                    if let Some(stops) = stops.stop_visible {
-                        assert_eq!(stops, ["<|close|>call<|sep|>", "<|close|> call <|sep|>"]);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn malformed_visible_stop_capability_is_absent() {
-        let mut preprocessor = hidden_stop_preprocessor();
-        preprocessor.tool_call_parser = Some("kimi_k3".into());
-        preprocessor.runtime_config.runtime_data.insert(
-            crate::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY.into(),
-            serde_json::json!("true"),
-        );
-        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model":"m", "messages":[{"role":"user","content":"test"}],
-            "tools":[{"type":"function","function":{"name":"exec","parameters":{"type":"object"}}}],
-            "parallel_tool_calls":false
-        }))
+    fn single_call_requests_do_not_inject_parser_string_stops() {
+        let mdc = ModelDeploymentCard::load_from_disk(
+            "tests/data/sample-models/mock-llama-3.1-8b-instruct",
+            None,
+        )
         .unwrap();
-        let mut stops = crate::protocols::common::StopConditions::default();
-        preprocessor
-            .apply_single_tool_call_stop(&request, &mut stops)
-            .unwrap();
-        assert!(stops.stop_visible.is_none());
-    }
-
-    #[test]
-    fn single_call_boundary_respects_ignore_eos_and_resolved_glm_family() {
-        use crate::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY;
-        let mut preprocessor = hidden_stop_preprocessor();
+        let mut preprocessor = Arc::into_inner(OpenAIPreprocessor::new(mdc).unwrap()).unwrap();
         preprocessor
             .runtime_config
-            .set_engine_specific(VISIBLE_STOP_STRINGS_CAPABILITY, true)
+            .set_engine_specific(
+                crate::local_model::runtime_config::VISIBLE_STOP_STRINGS_CAPABILITY,
+                true,
+            )
             .unwrap();
         let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "m", "messages": [{"role": "user", "content": "test"}],
             "tools": [{"type": "function", "function": {"name": "exec", "parameters": {"type": "object"}}}],
             "parallel_tool_calls": false
         })).unwrap();
-        for (tool_parser, reasoning_parser, boundary) in [
-            (Some("kimi_k3"), None, "<|close|>call<|sep|>"),
-            (Some("glm4"), None, "</tool_call>"),
-            (Some("glm47"), None, "</tool_call>"),
-            (None, Some("glm45"), "</tool_call>"),
-        ] {
-            preprocessor.tool_call_parser = tool_parser.map(str::to_string);
-            preprocessor.runtime_config.reasoning_parser = reasoning_parser.map(str::to_string);
-            for ignore_eos in [None, Some(false), Some(true)] {
-                let mut stops = crate::protocols::common::StopConditions {
-                    ignore_eos,
-                    ..Default::default()
-                };
-                preprocessor
-                    .apply_single_tool_call_stop(&request, &mut stops)
-                    .unwrap();
-                assert_eq!(
-                    stops.stop_visible,
-                    (ignore_eos != Some(true)).then(|| {
-                        if tool_parser == Some("kimi_k3") {
-                            vec![boundary.to_string(), "<|close|> call <|sep|>".to_string()]
-                        } else {
-                            vec![boundary.to_string()]
-                        }
-                    }),
-                    "{tool_parser:?}/{reasoning_parser:?}/{ignore_eos:?}"
-                );
-            }
+        for parser in ["kimi_k3", "glm4", "glm47"] {
+            preprocessor.tool_call_parser = Some(parser.into());
+            let preprocessed = preprocessor
+                .builder(&request)
+                .unwrap()
+                .token_ids(vec![1])
+                .build()
+                .unwrap();
+            assert!(
+                preprocessed
+                    .stop_conditions
+                    .stop_visible
+                    .as_ref()
+                    .is_none_or(Vec::is_empty),
+                "{parser}"
+            );
         }
     }
 
@@ -16197,7 +16100,9 @@ responses_tools: None,
                     .unwrap();
                 let result = preprocessor.preprocess_request(&request, None).await;
                 if add_generation_prompt && !requested && !tail.trim_end().ends_with("</think>") {
-                    let error = result.err().expect("unknown thinking-off prefill must fail");
+                    let error = result
+                        .err()
+                        .expect("unknown thinking-off prefill must fail");
                     let error = error.downcast_ref::<DynamoError>().unwrap();
                     assert_eq!(error.error_type(), ErrorType::InvalidArgument);
                     assert!(

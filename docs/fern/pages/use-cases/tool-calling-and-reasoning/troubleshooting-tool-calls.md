@@ -134,17 +134,48 @@ the parser configuration, or the parser logic.
 
 ## Custom-Tool Grammar Constraints
 
-The Responses endpoint accepts regex and Lark grammar descriptors for custom tools,
-including namespace members and tools returned by client-side tool search. These
-formats are **advisory** in Dynamo: the model receives a freeform `input` string,
-and the response echoes the descriptor, but decoding does not enforce the grammar.
-The frontend logs a warning once per process when it receives a custom-tool grammar.
-This differs from an endpoint that guarantees grammar-constrained custom-tool output.
+If generated custom-tool input does not match its declared regex or Lark
+grammar, check the endpoint's decoding contract. Dynamo's Responses endpoint
+accepts these descriptors as **advisory** metadata. The model generates a
+freeform `input` string; decoding does not enforce the grammar. This also
+applies to tools grouped under a named namespace and tool declarations supplied
+by a client-side tool-search result. The response retains the descriptor.
 
-Validate each generated custom-tool input before executing the tool. If your client
-requires the endpoint to enforce a grammar, do not treat an HTTP 200 response or the
-echoed descriptor as proof of enforcement. Function-tool and response-format guided
-decoding use separate constraints; see [Structural Tags](structural-tag.md).
+The frontend logs this exact warning once per process:
+
+```text
+Responses custom-tool grammars are advisory; decoding does not enforce regex or Lark constraints
+```
+
+Validate each generated custom-tool input before executing it. An HTTP 200
+response or echoed descriptor does not establish grammar enforcement. If your
+client requires constrained output, use an endpoint that enforces that grammar.
+Function-tool and response-format guided decoding use separate constraints; see
+[Structural Tags](structural-tag.md).
+
+Older frontends can reject a Responses custom-tool grammar with:
+
+```text
+Custom tool grammar formats are not supported
+```
+
+If freeform input is acceptable, replace the custom tool's format with
+`{"type":"text"}` and validate the generated input in your application. This
+workaround does not enforce the original grammar. Chat Completions also rejects
+grammar formats; use its `text` format for freeform custom tools.
+
+## Incomplete GLM Tool Calls
+
+On deployments advertising `incomplete_glm_tool_call_errors=true`, an incomplete
+native GLM tool call at a backend `stop` or `tool_calls` finish, or at unexpected
+stream end, is a `BackendProtocol` failure. The TensorRT-LLM sidecar advertises
+this capability. Both unified/V2 and legacy/V1 GLM parsing enforce it.
+
+Already-parsed text is emitted before a streaming failure; a non-streaming
+request fails instead of returning a partial result. A backend `length` finish
+retains its token-limit behavior. Deployments without this capability retain
+their existing length/suppression behavior. Check the raw generated tool-call
+envelope and backend finish reason when investigating this error.
 
 ## Parser Generation Routing
 

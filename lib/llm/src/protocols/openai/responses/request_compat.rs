@@ -77,13 +77,13 @@ pub(super) fn kimi_history(
         } else if let Some(id) = message["tool_call_id"].as_str() {
             if let Some(index) = run.get(id).copied() {
                 let first = &mut merged[index]["content"];
-                if let (Some(a), Some(b)) = (first.as_str(), message["content"].as_str()) {
-                    let separator = if a.is_empty() || a.ends_with('\n') {
-                        ""
-                    } else {
-                        "\n"
-                    };
-                    *first = Value::String(format!("{a}{separator}{b}"));
+                if let (Value::String(a), Some(b)) = (&mut *first, message["content"].as_str()) {
+                    if !a.is_empty() && !a.ends_with('\n') {
+                        a.push('\n');
+                    }
+                    a.push_str(b);
+                } else if let Some(parts) = first.as_array_mut() {
+                    parts.extend(content_parts(&message["content"]));
                 } else {
                     let mut parts = content_parts(first);
                     parts.extend(content_parts(&message["content"]));
@@ -120,6 +120,8 @@ pub(super) fn kimi_history(
                 .flatten()
                 .filter_map(|call| call["id"].as_str().map(str::to_owned))
                 .collect();
+        } else {
+            calls.clear();
         }
         settled.push(message);
     }
@@ -181,6 +183,24 @@ mod tests {
         assert_eq!(value[2]["tool_call_id"], "b");
         assert_eq!(value[3]["role"], "user");
         assert_eq!(value[3]["content"][1]["text"], "orphan");
+        assert_eq!(kimi_history(&normalized).unwrap(), normalized);
+    }
+
+    #[test]
+    fn kimi_user_message_ends_the_tool_call_batch() {
+        let messages: Vec<super::super::ChatCompletionRequestMessage> =
+            serde_json::from_value(serde_json::json!([
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"type":"function","id":"a","function":{"name":"one","arguments":"{}"}}
+                ]},
+                {"role":"user","content":"new turn"},
+                {"role":"tool","tool_call_id":"a","content":"late result"}
+            ]))
+            .unwrap();
+        let normalized = kimi_history(&messages).unwrap();
+        let value = serde_json::to_value(&normalized).unwrap();
+        assert_eq!(value[2]["role"], "user");
+        assert_eq!(value[2]["content"][1]["text"], "late result");
         assert_eq!(kimi_history(&normalized).unwrap(), normalized);
     }
 
