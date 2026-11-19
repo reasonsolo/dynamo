@@ -44,16 +44,15 @@ async fn duplicate_fields_fail_before_responses_dispatch() {
             ("tools", json!([])),
             ("stream", json!(true)),
         ] {
-            cases.push((
-                format!(r#"{{"model":"{MODEL}","input":"ping","tools":[],"stream":false,"{field}":{value}}}"#),
-                format!("duplicate JSON object field \"{field}\""),
+            cases.push(format!(
+                r#"{{"model":"{MODEL}","input":"ping","tools":[],"stream":false,"{field}":{value}}}"#
             ));
         }
-        cases.push((
-            format!(r#"{{"model":"{MODEL}","input":"ping","nvext":{{"metadata_upload":{{"kind":"generation_artifact","contents":[],"mode":"object_store","destination":{{"kind":"presigned_http_put","url":"https://example.com/upload","required_headers":{{"X-Token":"private-a","X-Token":"private-b"}},"expires_at":"2030-01-01T00:00:00Z","max_bytes":100,"object_id":"object"}}}}}}}}"#),
-            "duplicate metadata_upload field".to_string(),
+        cases.push(format!(r#"{{"model":"{MODEL}","input":"ping","nvext":{{"metadata_upload":{{"kind":"generation_artifact","contents":[],"mode":"object_store","destination":{{"kind":"presigned_http_put","url":"https://example.com/upload","required_headers":{{"X-Token":"private-a","X-Token":"private-b"}},"expires_at":"2030-01-01T00:00:00Z","max_bytes":100,"object_id":"object"}}}}}}}}"#));
+        cases.push(format!(
+            r#"{{"model":"{MODEL}","input":"ping","metadata":{{"private-key":"private-a","private-key":"private-b"}}}}"#
         ));
-        for (body, expected) in cases {
+        for body in cases {
             let response = svc
                 .client
                 .post(format!("{}/v1/responses", svc.base_url))
@@ -62,10 +61,10 @@ async fn duplicate_fields_fail_before_responses_dispatch() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST, "{expected}");
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
             let body: Value = response.json().await.unwrap();
             let message = body["message"].as_str().unwrap();
-            assert!(message.contains(&expected), "{message}");
+            assert!(message.contains("duplicate JSON object field at line "), "{message}");
             assert!(!message.contains("X-Token") && !message.contains("private-"), "{message}");
             assert!(!message.contains("other-model") && !message.contains("other-input"), "{message}");
         }

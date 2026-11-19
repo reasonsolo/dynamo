@@ -62,19 +62,16 @@ fn borrowed_header_value<'a>(headers: &'a HeaderMap, header_name: &str) -> Optio
 }
 
 pub(crate) fn agent_context_header_values(headers: &HeaderMap) -> Option<AgentContextHeaderValues> {
-    let session_final = header_bool(headers, HEADER_DYNAMO_SESSION_FINAL);
-
     if let Some(session_id) = borrowed_header_value(headers, HEADER_DYNAMO_SESSION_ID) {
-        return Some(AgentContextHeaderValues {
-            parent_session_id: borrowed_header_value(headers, HEADER_DYNAMO_PARENT_SESSION_ID)
-                .filter(|parent_session_id| *parent_session_id != session_id)
-                .map(str::to_owned),
-            session_id: session_id.to_owned(),
-            session_final,
-            agent_headers: capture_agent_headers(headers),
-        });
+        return Some(dynamo_agent_context_header_values(
+            headers,
+            session_id.to_owned(),
+        ));
     }
+    mapped_agent_context_header_values(headers)
+}
 
+fn mapped_agent_context_header_values(headers: &HeaderMap) -> Option<AgentContextHeaderValues> {
     for mapping in AGENT_HEADER_MAPPINGS {
         let Some(root_session_id) = borrowed_header_value(headers, mapping.root_session_header)
         else {
@@ -99,11 +96,41 @@ pub(crate) fn agent_context_header_values(headers: &HeaderMap) -> Option<AgentCo
         return Some(AgentContextHeaderValues {
             session_id: session_id.to_owned(),
             parent_session_id,
-            session_final,
+            session_final: header_bool(headers, HEADER_DYNAMO_SESSION_FINAL),
             agent_headers: capture_agent_headers(headers),
         });
     }
     None
+}
+
+pub(crate) fn agent_context_header_values_for_session(
+    headers: &HeaderMap,
+    session_id: String,
+) -> AgentContextHeaderValues {
+    if borrowed_header_value(headers, HEADER_DYNAMO_SESSION_ID).is_none()
+        && let Some(mut values) = mapped_agent_context_header_values(headers)
+    {
+        values.parent_session_id = values
+            .parent_session_id
+            .filter(|parent| *parent != session_id);
+        values.session_id = session_id;
+        return values;
+    }
+    dynamo_agent_context_header_values(headers, session_id)
+}
+
+fn dynamo_agent_context_header_values(
+    headers: &HeaderMap,
+    session_id: String,
+) -> AgentContextHeaderValues {
+    AgentContextHeaderValues {
+        parent_session_id: borrowed_header_value(headers, HEADER_DYNAMO_PARENT_SESSION_ID)
+            .filter(|parent| *parent != session_id)
+            .map(str::to_owned),
+        session_id,
+        session_final: header_bool(headers, HEADER_DYNAMO_SESSION_FINAL),
+        agent_headers: capture_agent_headers(headers),
+    }
 }
 
 const MAX_AGENT_HEADER_VALUES: usize = 64;

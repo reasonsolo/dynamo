@@ -6,106 +6,10 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
-use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 
-/// Decode JSON without discarding repeated keys at any object depth.
-pub(crate) struct UniqueJsonValue<const REPORT_DUPLICATE_KEY: bool = false>(pub(crate) Value);
-
-impl<'de, const REPORT_DUPLICATE_KEY: bool> Deserialize<'de>
-    for UniqueJsonValue<REPORT_DUPLICATE_KEY>
-{
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct UniqueValueVisitor<const REPORT_DUPLICATE_KEY: bool>;
-
-        impl<'de, const REPORT_DUPLICATE_KEY: bool> Visitor<'de>
-            for UniqueValueVisitor<REPORT_DUPLICATE_KEY>
-        {
-            type Value = UniqueJsonValue<REPORT_DUPLICATE_KEY>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a JSON value without duplicate object fields")
-            }
-
-            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
-                Ok(UniqueJsonValue(Value::Bool(value)))
-            }
-
-            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
-                Ok(UniqueJsonValue(Value::from(value)))
-            }
-
-            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
-                Ok(UniqueJsonValue(Value::from(value)))
-            }
-
-            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                serde_json::Number::from_f64(value)
-                    .map(|number| UniqueJsonValue(Value::Number(number)))
-                    .ok_or_else(|| E::custom("invalid metadata_upload number"))
-            }
-
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(UniqueJsonValue(Value::String(value.to_owned())))
-            }
-
-            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(UniqueJsonValue(Value::String(value)))
-            }
-
-            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueJsonValue(Value::Null))
-            }
-
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(UniqueJsonValue(Value::Null))
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(
-                self,
-                mut sequence: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut values = Vec::new();
-                while let Some(UniqueJsonValue(value)) = sequence.next_element::<Self::Value>()? {
-                    values.push(value);
-                }
-                Ok(UniqueJsonValue(Value::Array(values)))
-            }
-
-            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
-                let mut values = serde_json::Map::new();
-                while let Some(key) = map.next_key::<String>()? {
-                    // Metadata destinations can use private header names as object keys.
-                    let value = if REPORT_DUPLICATE_KEY && key == "metadata_upload" {
-                        map.next_value::<UniqueJsonValue<false>>()?.0
-                    } else {
-                        map.next_value::<Self::Value>()?.0
-                    };
-                    match values.entry(key) {
-                        serde_json::map::Entry::Vacant(entry) => {
-                            entry.insert(value);
-                        }
-                        serde_json::map::Entry::Occupied(entry) => {
-                            if REPORT_DUPLICATE_KEY {
-                                let key: String = entry.key().chars().take(64).collect();
-                                return Err(serde::de::Error::custom(format!(
-                                    "duplicate JSON object field {key:?}"
-                                )));
-                            }
-                            return Err(serde::de::Error::custom(
-                                "duplicate metadata_upload field",
-                            ));
-                        }
-                    }
-                }
-                Ok(UniqueJsonValue(Value::Object(values)))
-            }
-        }
-
-        deserializer.deserialize_any(UniqueValueVisitor::<REPORT_DUPLICATE_KEY>)
-    }
-}
+use super::unique_json::UniqueJsonValue;
 
 /// The legacy prefix contract and the explicitly selected artifact contract.
 #[derive(Clone, PartialEq)]
@@ -131,7 +35,8 @@ impl Serialize for MetadataUpload {
 
 impl<'de> Deserialize<'de> for MetadataUpload {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let UniqueJsonValue(value) = UniqueJsonValue::<false>::deserialize(deserializer)?;
+        let UniqueJsonValue(value) = UniqueJsonValue::deserialize(deserializer)
+            .map_err(|_| serde::de::Error::custom("invalid metadata_upload JSON"))?;
         let object = value
             .as_object()
             .ok_or_else(|| serde::de::Error::custom("metadata_upload must be an object"))?;

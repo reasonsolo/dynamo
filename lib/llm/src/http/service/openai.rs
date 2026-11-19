@@ -62,6 +62,7 @@ use crate::preprocessor::{
     PRESERVE_OMITTED_MAX_TOKENS_CONTEXT_KEY, REQUEST_PARSING_OPTIONS_CONTEXT_KEY,
     decode_base64_to_floats,
 };
+use crate::protocols::agents::agent_context_header_values_for_session;
 use crate::protocols::common::extensions::{
     AGENT_CONTEXT_CONTEXT_KEY, AgentContext, InputTrigger, NvExt as CommonNvExt,
     SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId, UPSTREAM_ELAPSED_CONTEXT_KEY,
@@ -71,7 +72,7 @@ use crate::protocols::common::extensions::{
 use crate::protocols::common::input_trigger::{
     classify_chat_request, classify_completion_request, classify_response_request,
 };
-use crate::protocols::common::metadata_upload::UniqueJsonValue;
+use crate::protocols::common::unique_json::UniqueJsonValue;
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::chat_completions::tool_call_merge::{
     ToolCallMergeOutcome, merge_tool_call_chunk,
@@ -2953,7 +2954,7 @@ where
 fn drop_duplicate_reasoning(body: &[u8]) -> Option<Vec<u8>> {
     // A plain `Value` keeps the last copy of a repeated key, so it would accept a second
     // `model` or `messages` that the typed parse rejects.
-    let UniqueJsonValue(mut value) = serde_json::from_slice::<UniqueJsonValue>(body).ok()?;
+    let UniqueJsonValue(mut value) = serde_json::from_slice(body).ok()?;
     let messages = value.get_mut("messages")?.as_array_mut()?;
     for message in messages.iter_mut() {
         if let Some(object) = message.as_object_mut()
@@ -4920,18 +4921,11 @@ fn apply_responses_body_affinity(
     let Some(affinity) = affinity else {
         return;
     };
-    let mut agent = agent_context_from_headers(headers).unwrap_or(AgentContext {
-        session_id: affinity.clone(),
-        parent_session_id: None,
-        session_final: None,
-        agent_headers: Default::default(),
-        input_trigger: None,
-    });
-    agent.session_id = affinity.clone();
+    let mut agent = AgentContext::from(agent_context_header_values_for_session(
+        headers,
+        affinity.clone(),
+    ));
     agent.input_trigger = Some(classify_response_request(request.content()));
-    if agent.parent_session_id.as_deref() == Some(affinity.as_str()) {
-        agent.parent_session_id = None;
-    }
     request.insert(
         SESSION_AFFINITY_CONTEXT_KEY,
         SessionAffinityId::new(affinity),
@@ -4948,8 +4942,7 @@ async fn handler_responses(
     body: Body,
 ) -> Result<Response, ErrorResponse> {
     let body = read_json_request_body(&headers, body).await?;
-    let UniqueJsonValue(mut body_value) =
-        parse_json_request::<UniqueJsonValue<true>>("responses", &body)?;
+    let UniqueJsonValue(mut body_value) = parse_json_request("responses", &body)?;
     // Custom tool results share function-result conversion and media policy.
     if let Some(items) = body_value
         .get_mut("input")
@@ -7110,15 +7103,17 @@ mod tests {
 
     #[test]
     fn body_affinity_obeys_explicit_body_then_header_then_fallback_precedence() {
-        for (header, explicit, expected) in [
-            (None, false, "body"),
-            (Some("header"), false, "header"),
-            (Some("header"), true, "body"),
+        for (header, explicit, expected, expected_parent) in [
+            (None, false, "body", Some("header")),
+            (Some("x-session-id"), false, "header", None),
+            (Some("x-session-id"), true, "body", None),
+            (Some("x-dynamo-session-id"), true, "body", Some("header")),
         ] {
             let mut headers = HeaderMap::new();
-            if let Some(value) = header {
-                headers.insert("x-session-id", value.parse().unwrap());
+            if let Some(name) = header {
+                headers.insert(name, "header".parse().unwrap());
             }
+            headers.insert("x-dynamo-parent-session-id", "header".parse().unwrap());
             let mut context =
                 context_from_headers(NvCreateResponse::default(), "r".into(), &headers).unwrap();
             apply_responses_body_affinity(&mut context, &headers, Some("body".into()), explicit);
@@ -7130,6 +7125,7 @@ mod tests {
                 .get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
                 .unwrap();
             assert_eq!(agent.session_id, expected);
+            assert_eq!(agent.parent_session_id.as_deref(), expected_parent);
         }
     }
 
@@ -7137,6 +7133,8 @@ mod tests {
     fn cache_and_correlation_hints_do_not_establish_session_affinity() {
         let mut headers = HeaderMap::new();
         headers.insert("x-correlation-id", "gateway-request-id".parse().unwrap());
+        headers.insert("x-dynamo-parent-session-id", "parent".parse().unwrap());
+        headers.insert("x-dynamo-session-final", "true".parse().unwrap());
         for conversation in [None, Some("conversation")] {
             let body = serde_json::json!({
                 "prompt_cache_key": "x".repeat(257),
@@ -7156,6 +7154,15 @@ mod tests {
                     .map(SessionAffinityId::as_str),
                 conversation
             );
+            let agent = request.get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY).ok();
+            assert_eq!(
+                agent.as_deref().map(|agent| agent.session_id.as_str()),
+                conversation,
+            );
+            if let Some(agent) = agent {
+                assert_eq!(agent.parent_session_id.as_deref(), Some("parent"));
+                assert_eq!(agent.session_final, Some(true));
+            }
         }
     }
 
