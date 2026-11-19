@@ -1174,11 +1174,14 @@ mod tests {
         use dynamo_runtime::pipeline::network::StreamPrologueError;
         use dynamo_runtime::pipeline::network::egress::addressed_router::testing::pre_stream_failure_error;
 
-        for error_type in [
-            ErrorType::InvalidArgument,
-            ErrorType::Backend(BackendError::InvalidArgument),
-            ErrorType::InvalidRequest,
-            ErrorType::NotImplemented,
+        for (error_type, expected_class) in [
+            (ErrorType::InvalidArgument, ErrorType::InvalidRequest),
+            (
+                ErrorType::Backend(BackendError::InvalidArgument),
+                ErrorType::InvalidRequest,
+            ),
+            (ErrorType::InvalidRequest, ErrorType::InvalidRequest),
+            (ErrorType::NotImplemented, ErrorType::NotImplemented),
         ] {
             let worker_error = DynamoError::builder()
                 .error_type(error_type)
@@ -1188,15 +1191,7 @@ mod tests {
                 format!("Generate Error: {worker_error}"),
                 worker_error,
             ));
-            assert_eq!(
-                err.class(),
-                if error_type == ErrorType::NotImplemented {
-                    ErrorType::NotImplemented
-                } else {
-                    ErrorType::InvalidRequest
-                },
-                "{error_type:?}"
-            );
+            assert_eq!(err.class(), expected_class, "{error_type:?}");
             assert!(
                 !error::match_error_chain(&err, &[ErrorType::CannotConnect], &[]),
                 "{error_type:?} must not carry a CannotConnect ancestor"

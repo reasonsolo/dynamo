@@ -105,22 +105,17 @@ pub(crate) fn pre_stream_failure_error(error: StreamPrologueError) -> DynamoErro
 
     match error.typed_error {
         Some(typed)
-            if !is_migration_sensitive(&typed) && is_worker_request_rejection(typed.class()) =>
+            if !is_migration_sensitive(&typed)
+                && matches!(
+                    typed.class(),
+                    ErrorClass::InvalidRequest | ErrorClass::NotImplemented
+                ) =>
         {
             typed
         }
         Some(typed) if !is_migration_sensitive(&typed) => builder.cause(typed).build(),
         _ => builder.build(),
     }
-}
-
-/// Worker prologue statuses that reject only this request rather than indicate
-/// a worker or transport fault.
-fn is_worker_request_rejection(class: ErrorClass) -> bool {
-    matches!(
-        class,
-        ErrorClass::InvalidRequest | ErrorClass::NotImplemented
-    )
 }
 
 /// White-box handles for the cross-crate tests in `dynamo-llm`. Gated so a
