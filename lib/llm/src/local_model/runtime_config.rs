@@ -41,6 +41,9 @@ pub const REJECT_INCOMPLETE_NATIVE_TOOL_CALLS_CAPABILITY: &str =
 /// Render Responses context overflow as an in-protocol failed event stream.
 pub const RESPONSES_CONTEXT_OVERFLOW_EVENTS_CAPABILITY: &str = "responses_context_overflow_events";
 
+/// Complete input-modality list advertised by a worker; absence means unknown.
+pub const SUPPORTED_INPUT_MODALITIES: &str = "supported_input_modalities";
+
 /// Runtime-data key for an engine-published token-overflow contract.
 pub const TOKEN_BUDGET_RUNTIME_KEY: &str = "token_budget";
 
